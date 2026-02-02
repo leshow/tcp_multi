@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     mem,
     net::SocketAddr,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 use crate::msg::SerialMsg;
 
 mod msg;
+pub mod pool;
 
 #[derive(Debug)]
 pub struct DnsQuery<T> {
@@ -60,6 +61,8 @@ pub struct PendingResponse<T> {
 
 #[derive(Debug)]
 pub struct TcpConnection {
+    read_fd: RawFd,
+    addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
     queued_tx: mpsc::UnboundedSender<PendingSend<SerialMsg>>,
     next_id: Arc<AtomicU16>,
@@ -75,29 +78,19 @@ impl TcpConnection {
     pub async fn new(addr: SocketAddr, max_in_flight: Option<usize>) -> Result<Arc<Self>> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (read, send) = tcpstream_connect(addr).await?.into_split();
+        let read_fd = read.as_ref().as_raw_fd();
         let (queued_tx, queued_rx) = mpsc::unbounded_channel();
-
-        let is_closing = Arc::new(AtomicBool::new(false));
-        // let last_activity = Arc::new(Instant::now());
-        let mut this = Self {
-            pending: pending.clone(),
-            tasks: JoinSet::new(),
-            queued_tx,
-            next_id: Arc::new(AtomicU16::new(0)),
-            is_closing: is_closing.clone(),
-            // last_activity: last_activity.clone(),
-            max_in_flight,
-        };
-        this.tasks.spawn(read_half(
+        let (is_closing, mut conn) = new_conn(read_fd, addr, max_in_flight, &pending, queued_tx);
+        conn.tasks.spawn(read_half(
             read,
             addr,
             is_closing,
             // last_activity,
             pending.clone(),
         ));
-        this.tasks.spawn(send_half(send, queued_rx, pending));
+        conn.tasks.spawn(send_half(send, queued_rx, pending));
 
-        Ok(Arc::new(this))
+        Ok(Arc::new(conn))
     }
 
     // copied from new for testing
@@ -110,32 +103,30 @@ impl TcpConnection {
         max_in_flight: Option<usize>,
     ) -> Result<Arc<Self>>
     where
-        R: AsyncReadExt + Unpin + Send + 'static,
+        R: AsyncReadExt + Unpin + Send + 'static + AsRawFd,
         W: AsyncWriteExt + Unpin + Send + 'static,
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (queued_tx, queued_rx) = mpsc::unbounded_channel();
+        let read_fd = read.as_raw_fd();
 
-        let is_closing = Arc::new(AtomicBool::new(false));
-        let mut this = Self {
-            pending: pending.clone(),
-            tasks: JoinSet::new(),
-            queued_tx,
-            next_id: Arc::new(AtomicU16::new(0)),
-            is_closing: is_closing.clone(),
-            max_in_flight,
-        };
-        this.tasks
-            .spawn(read_half(read, addr, is_closing, pending.clone()));
-        this.tasks.spawn(send_half(send, queued_rx, pending));
+        let (is_closing, mut conn) = new_conn(read_fd, addr, max_in_flight, &pending, queued_tx);
+        conn.tasks.spawn(read_half(
+            read,
+            addr,
+            is_closing,
+            // last_activity,
+            pending.clone(),
+        ));
+        conn.tasks.spawn(send_half(send, queued_rx, pending));
 
-        Ok(Arc::new(this))
+        Ok(Arc::new(conn))
     }
 
     // @TODO can be async if switch to bounded chan
     pub fn send(&self, query: DnsQuery<SerialMsg>) -> Result<()> {
         // should this be done in the pool and not on send?
-        if !self.is_healthy() || self.queued_tx.is_closed() {
+        if !self.will_be_reusable() || self.queued_tx.is_closed() {
             self.set_closing();
             return Err(anyhow::Error::msg("connection unhealthy"));
         }
@@ -161,13 +152,14 @@ impl TcpConnection {
         }
         Ok(())
     }
+
     fn set_closing(&self) {
         self.is_closing.swap(true, Ordering::Relaxed);
     }
     fn is_closing(&self) -> bool {
         self.is_closing.load(Ordering::Relaxed)
     }
-    pub fn is_healthy(&self) -> bool {
+    pub fn will_be_reusable(&self) -> bool {
         if self.is_closing() {
             return false;
         }
@@ -180,18 +172,54 @@ impl TcpConnection {
                 return false;
             }
         }
-        self.is_usable()
+        self.is_healthy()
     }
+    pub fn can_reuse(&self) -> bool {
+        if self.is_closing() {
+            return false;
+        }
+        if self.reached_max_id() {
+            return false;
+        }
+        self.is_healthy()
+    }
+
     fn reached_max_id(&self) -> bool {
         self.next_id.load(Ordering::Relaxed) >= MAX_ID
     }
-    pub fn is_usable(&self) -> bool {
-        // @TODO peek
-        true
+    pub fn is_healthy(&self) -> bool {
+        match getso_err(&self.read_fd) {
+            Ok(_) => true,
+            Err(err) => {
+                warn!(%err, "is_healthy returned false-- connection closed by remote");
+                false
+            }
+        }
     }
     pub fn is_idle(&self) -> bool {
         self.pending.lock().unwrap().is_empty()
     }
+}
+
+fn new_conn(
+    read_fd: RawFd,
+    addr: SocketAddr,
+    max_in_flight: Option<usize>,
+    pending: &Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
+    queued_tx: mpsc::UnboundedSender<PendingSend<SerialMsg>>,
+) -> (Arc<AtomicBool>, TcpConnection) {
+    let is_closing = Arc::new(AtomicBool::new(false));
+    let this = TcpConnection {
+        read_fd,
+        addr,
+        pending: pending.clone(),
+        tasks: JoinSet::new(),
+        queued_tx,
+        next_id: Arc::new(AtomicU16::new(0)),
+        is_closing: is_closing.clone(),
+        max_in_flight,
+    };
+    (is_closing, this)
 }
 
 async fn read_half<R: AsyncReadExt + Unpin>(
@@ -343,6 +371,26 @@ fn set_socket_option<Fd: AsRawFd>(
     }
 }
 
+fn getso_err<Fd: AsRawFd>(fd: &Fd) -> Result<(), std::io::Error> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+    unsafe {
+        // Correct way to call getsockopt for SO_ERROR
+        let n = libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &raw mut err as *mut _ as *mut _,
+            &raw mut len,
+        );
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +403,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, split};
 
     // Helper to create a mock DNS message using hickory-proto
-    fn create_hickory_msg(id: u16, name: &str) -> Message {
+    fn new_msg(id: u16, name: &str) -> Message {
         let name = Name::from_str(name).unwrap();
         let query = Query::query(name, RecordType::A);
         let mut message = Message::new();
@@ -368,7 +416,7 @@ mod tests {
         message
     }
 
-    async fn setup_test_conn(
+    async fn test_conn(
         max_flight: Option<usize>,
     ) -> (Arc<TcpConnection>, tokio::io::DuplexStream, SocketAddr) {
         let (client, server) = tokio::io::duplex(BUF_SIZE);
@@ -380,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_and_receive_ok() {
-        let (conn, mut server, addr) = setup_test_conn(None).await;
+        let (conn, mut server, addr) = test_conn(None).await;
 
         // Test server task that mimics a DNS server
         tokio::spawn(async move {
@@ -399,17 +447,17 @@ mod tests {
             assert_eq!(received_id, 0);
 
             // Create a response message, using the internal ID
-            let mut response = create_hickory_msg(received_id, "example.com.");
-            response.set_message_type(MessageType::Response);
-            let serial_response = SerialMsg::from_message(&response, addr).unwrap();
+            let mut resp = new_msg(received_id, "example.com.");
+            resp.set_message_type(MessageType::Response);
+            let msg = SerialMsg::from_message(&resp, addr).unwrap();
 
             // Send the response back
-            serial_response.write(&mut server).await.unwrap();
+            msg.write(&mut server).await.unwrap();
         });
 
         let (tx, rx) = oneshot::channel();
         let original_id = 1234;
-        let query_msg = create_hickory_msg(original_id, "example.com.");
+        let query_msg = new_msg(original_id, "example.com.");
         let query = DnsQuery {
             to_send: SerialMsg::from_message(&query_msg, addr).unwrap(),
             reply: tx,
@@ -428,25 +476,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_in_flight() {
-        let (conn, _server, addr) = setup_test_conn(Some(1)).await;
+        let (conn, _server, addr) = test_conn(Some(1)).await;
 
         let (tx, _rx) = oneshot::channel();
-        let query_msg = create_hickory_msg(1, "query1.com.");
+        let query_msg = new_msg(1, "query1.com.");
         let query = DnsQuery {
             to_send: SerialMsg::from_message(&query_msg, addr).unwrap(),
             reply: tx,
         };
 
         // First send should be ok
-        assert!(conn.is_healthy());
+        assert!(conn.will_be_reusable());
         conn.send(query).unwrap();
 
         // Connection should now be unhealthy due to max_in_flight
-        assert!(!conn.is_healthy());
+        assert!(!conn.will_be_reusable());
 
         // Second send should fail
         let (tx2, _rx2) = oneshot::channel();
-        let query_msg2 = create_hickory_msg(2, "query2.com.");
+        let query_msg2 = new_msg(2, "query2.com.");
         let query2 = DnsQuery {
             to_send: SerialMsg::from_message(&query_msg2, addr).unwrap(),
             reply: tx2,
@@ -456,8 +504,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_closes_on_read_error() {
-        let (conn, server, _) = setup_test_conn(None).await;
-        assert!(conn.is_healthy());
+        let (conn, server, _) = test_conn(None).await;
+        assert!(conn.will_be_reusable());
 
         // Drop the server end to cause a read error in the connection's read_half
         drop(server);
@@ -465,20 +513,20 @@ mod tests {
         // Wait a moment for the read_half task to detect the error and set is_closing
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        assert!(!conn.is_healthy());
+        assert!(!conn.will_be_reusable());
         assert!(conn.is_closing());
     }
 
     #[tokio::test]
     async fn test_connection_closes_on_send_error() {
-        let (conn, server, addr) = setup_test_conn(None).await;
-        assert!(conn.is_healthy());
+        let (conn, server, addr) = test_conn(None).await;
+        assert!(conn.will_be_reusable());
 
         // Drop the server end to cause a write error
         drop(server);
 
         let (tx, rx) = oneshot::channel();
-        let query_msg = create_hickory_msg(1, "query1.com.");
+        let query_msg = new_msg(1, "query1.com.");
         let query = DnsQuery {
             to_send: SerialMsg::from_message(&query_msg, addr).unwrap(),
             reply: tx,
@@ -495,7 +543,7 @@ mod tests {
         // Wait a moment for the tasks to process the error and update state
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        assert!(!conn.is_healthy());
+        assert!(!conn.will_be_reusable());
         assert!(conn.is_closing());
     }
 }
