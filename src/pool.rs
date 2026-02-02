@@ -18,16 +18,16 @@ struct ConnectionPool {
     /// Maximum idle connections per backend
     max_idle_conns: usize,
     /// Maximum idle time before cleanup
-    max_idle_time: Option<Duration>,
+    max_idle_time: Duration,
     max_in_flight_per: Option<usize>,
     ka_idle: Option<u64>,
     ka_interval: Option<u64>,
 }
 
 impl ConnectionPool {
-    fn new(
+    pub fn new(
         max_idle_conns: usize,
-        max_idle_time: Option<Duration>,
+        max_idle_time: Duration,
         max_in_flight_per: Option<usize>,
         ka_idle: Option<u64>,
         ka_interval: Option<u64>,
@@ -57,7 +57,7 @@ impl ConnectionPool {
                             .write()
                             .unwrap()
                             .entry(addr)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(Arc::clone(&conn));
 
                         return Ok(conn);
@@ -106,7 +106,7 @@ impl ConnectionPool {
             .write()
             .unwrap()
             .entry(addr)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Arc::clone(&conn));
 
         Ok(conn)
@@ -132,7 +132,7 @@ impl ConnectionPool {
         // Add to idle
         {
             let mut idle_map = self.idle.write().unwrap();
-            let connections = idle_map.entry(addr).or_insert_with(Vec::new);
+            let connections = idle_map.entry(addr).or_default();
 
             if connections.len() >= self.max_idle_conns {
                 if let Some(old) = connections.pop() {

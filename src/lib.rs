@@ -68,7 +68,7 @@ pub struct TcpConnection {
     queued_tx: mpsc::UnboundedSender<PendingSend<SerialMsg>>,
     next_id: Arc<AtomicU16>,
     is_closing: Arc<AtomicBool>,
-    created_at: Instant,
+    // created_at: Instant,
     last_activity: Arc<AtomicInstant>,
     // used to check SO_ERROR on socket
     read_fd: Option<RawFd>,
@@ -122,6 +122,9 @@ impl TcpConnection {
         Ok(Arc::new(conn))
     }
 
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
     // @TODO can be async if switch to bounded chan
     pub fn send(&self, query: DnsQuery<SerialMsg>) -> Result<()> {
         // should this be done in the pool and not on send?
@@ -254,7 +257,7 @@ fn new_conn(
         next_id: Arc::new(AtomicU16::new(0)),
         is_closing: is_closing.clone(),
         max_in_flight,
-        created_at: now,
+        // created_at: now,
         last_activity: Arc::new(AtomicInstant::new(now)),
     };
     (is_closing, this)
@@ -324,12 +327,12 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
     mut queued_msgs: mpsc::UnboundedReceiver<PendingSend<SerialMsg>>,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> Result<()> {
-    while let Some(msg) = queued_msgs.recv().await {
-        let PendingSend {
-            mut to_send,
-            reply,
-            next_id,
-        } = msg;
+    while let Some(PendingSend {
+        mut to_send,
+        reply,
+        next_id,
+    }) = queued_msgs.recv().await
+    {
         // swap id
         let original_id = to_send.msg_id();
         to_send.replace_id(u16::to_be_bytes(next_id));
@@ -518,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_and_receive_ok() {
-        let (conn, mut server, addr) = test_conn(None).await;
+        let (conn, server, addr) = test_conn(None).await;
         // start server
         let handle = test_server(server, addr);
 
