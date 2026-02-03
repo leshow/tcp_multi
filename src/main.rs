@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::{sync::Semaphore, time::interval};
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
     let addr = addr_str
         .parse()
         .with_context(|| format!("invalid tcp addr: {addr_str}"))?;
-    let max_in_flight: usize = std::env::args()
+    let total_in_flight: usize = std::env::args()
         .nth(2)
         .context("usage: tcp_multi <tcp_addr:port> <max_in_flight>")?
         .parse()
@@ -56,10 +57,10 @@ async fn main() -> Result<()> {
     };
 
     let udp = Arc::new(tokio::net::UdpSocket::bind("[::]:9953").await?);
-    info!(port = "9953", ?addr, "udp socket bound");
+    info!(?addr, "udp socket bound");
 
     let mut conn: Option<Arc<TcpConnection>> = None;
-    let in_flight = Arc::new(Semaphore::new(max_in_flight));
+    let in_flight = Arc::new(Semaphore::new(total_in_flight));
 
     {
         let in_flight = in_flight.clone();
@@ -68,8 +69,10 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let available = in_flight.available_permits();
-                let used = max_in_flight.saturating_sub(available);
-                info!(used, max_in_flight, "in-flight tasks");
+                let used = total_in_flight.saturating_sub(available);
+                if used > 0 {
+                    info!(used, total_in_flight, "in-flight tasks");
+                }
             }
         });
     }
@@ -86,7 +89,11 @@ async fn main() -> Result<()> {
 
         debug!(msg = ?msg.to_message());
 
-        if conn.as_ref().is_none_or(|existing| !existing.can_reuse()) {
+        if conn
+            .as_ref()
+            // !can_reuse()
+            .is_none_or(|existing| !existing.is_usable(Instant::now()))
+        {
             match TcpConnection::new(addr, config).await {
                 Ok(new_conn) => {
                     info!(?addr, "tcp connection established");

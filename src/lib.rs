@@ -15,10 +15,11 @@ use std::{
 use anyhow::Result;
 use atomic_time::AtomicInstant;
 use socket2::TcpKeepalive;
+use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{Mutex as TokioMutex, oneshot},
     task::JoinSet,
 };
 // use tokio_util::{bytes::Bytes, task::TaskTracker};
@@ -43,21 +44,16 @@ pub struct DnsQuery<T> {
     pub reply: oneshot::Sender<T>,
 }
 
-#[derive(Debug)]
-pub struct PendingSend<T> {
-    pub to_send: T,
-    pub next_id: u16,
-    pub reply: oneshot::Sender<T>,
-}
-
-impl<T> PendingSend<T> {
-    pub fn new(to_send: T, next_id: u16, reply: oneshot::Sender<T>) -> Self {
-        Self {
-            to_send,
-            reply,
-            next_id,
-        }
-    }
+#[derive(Debug, Error)]
+pub enum SendError {
+    #[error("connection closed")]
+    Closed { query: DnsQuery<SerialMsg> },
+    #[error("message too small")]
+    MessageTooSmall,
+    #[error("max id reached")]
+    MaxIdReached,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 const MAX_ID: u16 = u16::MAX - 1;
@@ -73,7 +69,7 @@ pub struct PendingResponse<T> {
 pub struct TcpConnection {
     addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
-    queued_tx: mpsc::Sender<PendingSend<SerialMsg>>,
+    writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>>,
     // @TODO remove individual Arcs and use Arc<TcpInner>?
     next_id: Arc<AtomicU16>,
     is_closing: Arc<AtomicBool>,
@@ -108,13 +104,14 @@ impl TcpConnection {
     ) -> Result<Arc<Self>>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
-        W: AsyncWriteExt + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (queued_tx, queued_rx) = mpsc::channel(config.chan_size);
+        let writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>> =
+            TokioMutex::new(Box::new(send));
 
         let (is_closing, mut conn) =
-            new_conn(read_fd, addr, config.max_in_flight, &pending, queued_tx);
+            new_conn(read_fd, addr, config.max_in_flight, &pending, writer);
         conn.tasks.spawn(read_half(
             read,
             addr,
@@ -122,7 +119,6 @@ impl TcpConnection {
             conn.last_read.clone(),
             pending.clone(),
         ));
-        conn.tasks.spawn(send_half(send, queued_rx, pending));
 
         Ok(Arc::new(conn))
     }
@@ -130,38 +126,63 @@ impl TcpConnection {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    pub async fn send(&self, query: DnsQuery<SerialMsg>) -> Result<()> {
+    pub async fn send(&self, query: DnsQuery<SerialMsg>) -> std::result::Result<(), SendError> {
         // should this be done in the pool and not on send?
-        if !self.can_reuse() || self.queued_tx.is_closed() {
+        if !self.can_reuse() {
             self.set_closing();
-            return Err(anyhow::Error::msg("connection unhealthy"));
+            return Err(SendError::Closed { query });
         }
         if query.to_send.bytes().len() < 12 {
             // notify err? msg too small
-            return Err(anyhow::Error::msg("message too small"));
+            return Err(SendError::MessageTooSmall);
+        }
+        let mut writer = self.writer.lock().await;
+        // could have closed after lock
+        if self.is_closing() {
+            return Err(SendError::Closed { query });
         }
         let next_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if next_id >= MAX_ID {
             self.set_closing();
+            return Err(SendError::Closed { query });
         }
-        let DnsQuery { to_send, reply } = query;
-        // note: there is a small race here where we could have reached the max_in_flight
-        // but still send because the send_half has not added to the pending map yet
-        // but it's inconsequential, the next send will error
 
-        if let Err(err) = self
-            .queued_tx
-            .send(PendingSend {
-                to_send,
-                next_id,
-                reply,
-            })
-            .await
+        let DnsQuery { mut to_send, reply } = query;
+        let original_id = to_send.msg_id();
+        to_send.replace_id(u16::to_be_bytes(next_id));
+
         {
-            warn!(%err, "TCP pending queue dropped, setting connection to closing");
+            let mut lock = self.pending.lock().unwrap();
+            lock.insert(
+                next_id,
+                PendingResponse {
+                    original_id,
+                    reply,
+                    sent_at: Instant::now(),
+                },
+            );
+        }
+
+        if let Err(err) = to_send.write(&mut *writer).await {
+            warn!(%err, "tcp write failed");
             self.set_closing();
+            self.drop_pending(next_id);
+            return Err(SendError::Io(err));
+        }
+        if let Err(err) = writer.flush().await {
+            warn!(%err, "TCP flush failed");
+            self.set_closing();
+            self.drop_pending(next_id);
+            return Err(SendError::Io(err));
         }
         Ok(())
+    }
+
+    fn drop_pending(&self, id: u16) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(resp) = pending.remove(&id) {
+            drop(resp.reply);
+        }
     }
 
     fn set_closing(&self) {
@@ -198,6 +219,7 @@ impl TcpConnection {
         }
 
         true
+        // self.is_healthy()
     }
     /// Check if connection is usable - matches dnsdist's isConnectionUsable
     pub fn is_usable(&self, now: Instant) -> bool {
@@ -253,7 +275,7 @@ fn new_conn(
     addr: SocketAddr,
     max_in_flight: Option<usize>,
     pending: &Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
-    queued_tx: mpsc::Sender<PendingSend<SerialMsg>>,
+    writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>>,
 ) -> (Arc<AtomicBool>, TcpConnection) {
     let is_closing = Arc::new(AtomicBool::new(false));
     let now = Instant::now();
@@ -262,7 +284,7 @@ fn new_conn(
         addr,
         pending: pending.clone(),
         tasks: JoinSet::new(),
-        queued_tx,
+        writer,
         next_id: Arc::new(AtomicU16::new(0)),
         is_closing: is_closing.clone(),
         max_in_flight,
@@ -330,55 +352,6 @@ async fn read_half<R: AsyncReadExt + Unpin>(
         // Just drop the sender, which will signal an error to the receiver
         drop(resp.reply);
     }
-    Ok(())
-}
-
-async fn send_half<W: AsyncWriteExt + Unpin>(
-    mut conn: W,
-    mut queued_msgs: mpsc::Receiver<PendingSend<SerialMsg>>,
-    pending: ResponseMap<PendingResponse<SerialMsg>>,
-) -> Result<()> {
-    while let Some(PendingSend {
-        mut to_send,
-        reply,
-        next_id,
-    }) = queued_msgs.recv().await
-    {
-        // swap id
-        let original_id = to_send.msg_id();
-        to_send.replace_id(u16::to_be_bytes(next_id));
-
-        trace!(?next_id, "sending message over TCP");
-        match to_send.write(&mut conn).await {
-            Ok(_) => {
-                {
-                    let mut lock = pending.lock().unwrap();
-                    // insert next_id and for recv
-                    lock.insert(
-                        next_id,
-                        PendingResponse {
-                            original_id,
-                            reply,
-                            sent_at: Instant::now(),
-                        },
-                    );
-                    drop(lock);
-                }
-                if let Err(err) = conn.flush().await {
-                    warn!(%err, "TCP flush failed");
-                    // notify_io_error?
-                    break;
-                }
-            }
-            Err(err) => {
-                // notify_io_error
-                warn!(%err, "send half error tcp");
-                break;
-            }
-        }
-    }
-    debug!("TCP send half exited");
-    // will drop queued_msgs and Sender will fail
     Ok(())
 }
 
@@ -642,9 +615,8 @@ mod tests {
         drop(server);
 
         let (query, rx) = dns_query(1, "query1.com.", addr);
-        // this send might succeed in queueing, but the send_half task will fail to write.
-        // then oneshots will be dropped
-        conn.send(query).await.unwrap();
+        // send should fail or the receiver should error because the connection is closed
+        let _ = conn.send(query).await;
 
         // this will err b/c sender was dropped
         let result = rx.await;
