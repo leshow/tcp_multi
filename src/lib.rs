@@ -26,8 +26,16 @@ use tracing::{debug, warn};
 
 use crate::msg::SerialMsg;
 
-mod msg;
+pub mod msg;
 pub mod pool;
+
+#[derive(Clone, Copy, Debug)]
+pub struct TcpConnectionConfig {
+    pub chan_size: usize,
+    pub ka_idle: Option<u64>,
+    pub ka_interval: Option<u64>,
+    pub max_in_flight: Option<usize>,
+}
 
 #[derive(Debug)]
 pub struct DnsQuery<T> {
@@ -65,7 +73,8 @@ pub struct PendingResponse<T> {
 pub struct TcpConnection {
     addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
-    queued_tx: mpsc::UnboundedSender<PendingSend<SerialMsg>>,
+    queued_tx: mpsc::Sender<PendingSend<SerialMsg>>,
+    // @TODO remove individual Arcs and use Arc<TcpInner>?
     next_id: Arc<AtomicU16>,
     is_closing: Arc<AtomicBool>,
     // created_at: Instant,
@@ -80,17 +89,12 @@ pub struct TcpConnection {
 type ResponseMap<T> = Arc<Mutex<HashMap<u16, T>>>;
 
 impl TcpConnection {
-    pub async fn new(
-        addr: SocketAddr,
-        ka_idle: Option<u64>,
-        ka_interval: Option<u64>,
-        max_in_flight: Option<usize>,
-    ) -> Result<Arc<Self>> {
-        let (read, send) = tcpstream_connect(addr, ka_idle, ka_interval)
+    pub async fn new(addr: SocketAddr, config: TcpConnectionConfig) -> Result<Arc<Self>> {
+        let (read, send) = tcpstream_connect(addr, config.ka_idle, config.ka_interval)
             .await?
             .into_split();
         let read_fd = read.as_ref().as_raw_fd();
-        Self::from_split(read, send, addr, Some(read_fd), max_in_flight)
+        Self::from_split(read, send, addr, config, Some(read_fd))
     }
 
     // copied from new for testing
@@ -99,17 +103,18 @@ impl TcpConnection {
         read: R,
         send: W,
         addr: SocketAddr,
+        config: TcpConnectionConfig,
         read_fd: Option<RawFd>,
-        max_in_flight: Option<usize>,
     ) -> Result<Arc<Self>>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
         W: AsyncWriteExt + Unpin + Send + 'static,
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (queued_tx, queued_rx) = mpsc::unbounded_channel();
+        let (queued_tx, queued_rx) = mpsc::channel(config.chan_size);
 
-        let (is_closing, mut conn) = new_conn(read_fd, addr, max_in_flight, &pending, queued_tx);
+        let (is_closing, mut conn) =
+            new_conn(read_fd, addr, config.max_in_flight, &pending, queued_tx);
         conn.tasks.spawn(read_half(
             read,
             addr,
@@ -125,10 +130,9 @@ impl TcpConnection {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    // @TODO can be async if switch to bounded chan
-    pub fn send(&self, query: DnsQuery<SerialMsg>) -> Result<()> {
+    pub async fn send(&self, query: DnsQuery<SerialMsg>) -> Result<()> {
         // should this be done in the pool and not on send?
-        if !self.will_be_reusable() || self.queued_tx.is_closed() {
+        if !self.can_reuse() || self.queued_tx.is_closed() {
             self.set_closing();
             return Err(anyhow::Error::msg("connection unhealthy"));
         }
@@ -136,19 +140,24 @@ impl TcpConnection {
             // notify err? msg too small
             return Err(anyhow::Error::msg("message too small"));
         }
-        let next_id = self.next_id.fetch_add(1, Ordering::Release);
+        let next_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if next_id >= MAX_ID {
             self.set_closing();
         }
         let DnsQuery { to_send, reply } = query;
         // note: there is a small race here where we could have reached the max_in_flight
         // but still send because the send_half has not added to the pending map yet
+        // but it's inconsequential, the next send will error
 
-        if let Err(err) = self.queued_tx.send(PendingSend {
-            to_send,
-            next_id,
-            reply,
-        }) {
+        if let Err(err) = self
+            .queued_tx
+            .send(PendingSend {
+                to_send,
+                next_id,
+                reply,
+            })
+            .await
+        {
             warn!(%err, "TCP pending queue dropped, setting connection to closing");
             self.set_closing();
         }
@@ -211,7 +220,7 @@ impl TcpConnection {
     }
     pub fn is_healthy(&self) -> bool {
         if let Some(read_fd) = self.read_fd {
-            return match getso_err(&read_fd) {
+            return match get_soerror(&read_fd) {
                 Ok(_) => true,
                 Err(err) => {
                     warn!(%err, "is_healthy returned false-- connection closed by remote");
@@ -244,7 +253,7 @@ fn new_conn(
     addr: SocketAddr,
     max_in_flight: Option<usize>,
     pending: &Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
-    queued_tx: mpsc::UnboundedSender<PendingSend<SerialMsg>>,
+    queued_tx: mpsc::Sender<PendingSend<SerialMsg>>,
 ) -> (Arc<AtomicBool>, TcpConnection) {
     let is_closing = Arc::new(AtomicBool::new(false));
     let now = Instant::now();
@@ -324,7 +333,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
 
 async fn send_half<W: AsyncWriteExt + Unpin>(
     mut conn: W,
-    mut queued_msgs: mpsc::UnboundedReceiver<PendingSend<SerialMsg>>,
+    mut queued_msgs: mpsc::Receiver<PendingSend<SerialMsg>>,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> Result<()> {
     while let Some(PendingSend {
@@ -388,23 +397,25 @@ async fn tcpstream_connect(
     // Enable TCP keepalive
     let mut keepalive = TcpKeepalive::new();
     if let Some(idle) = ka_idle {
-        keepalive = keepalive.with_time(Duration::from_secs(idle)); // Start probing after 10s idle
+        keepalive = keepalive.with_time(Duration::from_secs(idle)); // Start probing after Xs idle
     }
     if let Some(interval) = ka_interval {
-        keepalive = keepalive.with_interval(Duration::from_secs(interval)); // Probe every 5s
+        keepalive = keepalive.with_interval(Duration::from_secs(interval)); // Probe every Xs
     }
     soc.set_tcp_keepalive(&keepalive)?;
 
-    // soc.set_reuse_port(true)?;
     soc.set_nonblocking(true)?;
     soc.set_tcp_nodelay(true)?;
-    set_socket_option(&soc, libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, tfo_on)?;
 
+    // enable TFO
+    setsockopt(&soc, libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, tfo_on)?;
+
+    // build socket from raw fd
     let soc = unsafe { TcpSocket::from_raw_fd(soc.into_raw_fd()) };
     Ok(soc.connect(addr).await?)
 }
 
-fn set_socket_option<Fd: AsRawFd>(
+fn setsockopt<Fd: AsRawFd>(
     socket: &Fd,
     level: libc::c_int,
     name: libc::c_int,
@@ -427,7 +438,7 @@ fn set_socket_option<Fd: AsRawFd>(
     }
 }
 
-fn getso_err<Fd: AsRawFd>(fd: &Fd) -> Result<(), std::io::Error> {
+fn get_soerror<Fd: AsRawFd>(fd: &Fd) -> Result<(), std::io::Error> {
     let mut err: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
 
@@ -450,13 +461,17 @@ fn getso_err<Fd: AsRawFd>(fd: &Fd) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::{str::FromStr, time::Duration};
+
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RecordType},
     };
-    use std::str::FromStr;
-    use std::time::Duration;
-    use tokio::io::{self, DuplexStream};
+    use tokio::{
+        self,
+        io::{self, DuplexStream},
+    };
 
     // Helper to create a mock DNS message using hickory-proto
     fn new_msg(id: u16, name: &str) -> Message {
@@ -490,11 +505,18 @@ mod tests {
         max_flight: Option<usize>,
     ) -> (Arc<TcpConnection>, tokio::io::DuplexStream, SocketAddr) {
         // use duplex for testing b/c it's all in memory
+        const BUF_SIZE: usize = 4096;
         let (client, server) = io::duplex(BUF_SIZE);
         // split client for tcpconnection
         let (read, write) = io::split(client);
         let addr = "127.0.0.1:53".parse().unwrap();
-        let conn = TcpConnection::from_split(read, write, addr, None, max_flight).unwrap();
+        let config = TcpConnectionConfig {
+            chan_size: BUF_SIZE,
+            ka_idle: None,
+            ka_interval: None,
+            max_in_flight: max_flight,
+        };
+        let conn = TcpConnection::from_split(read, write, addr, config, None).unwrap();
         (conn, server, addr)
     }
     fn test_server(mut server: DuplexStream, addr: SocketAddr) -> tokio::task::JoinHandle<()> {
@@ -528,7 +550,7 @@ mod tests {
         let original_id = 1234;
         let (query, rx) = dns_query(original_id, "example.com.", addr);
 
-        conn.send(query).unwrap();
+        conn.send(query).await.unwrap();
 
         let response = rx.await.unwrap();
         // Check that the original ID was restored by the connection manager
@@ -538,7 +560,7 @@ mod tests {
         let original_id = 1235;
         let (query, rx) = dns_query(original_id, "google.com.", addr);
 
-        conn.send(query).unwrap();
+        conn.send(query).await.unwrap();
 
         let response = rx.await.unwrap();
         // Check that the original ID was restored by the connection manager
@@ -554,18 +576,18 @@ mod tests {
         let (query, _rx) = dns_query(1, "google.com.", addr);
 
         // First send should be ok
-        assert!(conn.will_be_reusable());
-        conn.send(query).unwrap();
+        assert!(conn.can_reuse());
+        conn.send(query).await.unwrap();
 
         // need to wait small amount of time for pending map to get added
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connection should now be unhealthy due to max_in_flight
-        assert!(!conn.will_be_reusable());
+        assert!(!conn.can_reuse());
 
         // Second send should fail
         let (query, _rx) = dns_query(2, "google.com.", addr);
-        assert!(conn.send(query).is_err());
+        assert!(conn.send(query).await.is_err());
     }
 
     #[tokio::test]
@@ -598,7 +620,7 @@ mod tests {
         let res = conn.send(query);
 
         // send errored
-        assert!(res.is_err());
+        assert!(res.await.is_err());
         assert!(!conn.will_be_reusable());
         assert!(conn.is_closing());
     }
@@ -614,7 +636,7 @@ mod tests {
         let (query, rx) = dns_query(1, "query1.com.", addr);
         // this send might succeed in queueing, but the send_half task will fail to write.
         // then oneshots will be dropped
-        let _ = conn.send(query);
+        conn.send(query).await.unwrap();
 
         // this will err b/c sender was dropped
         let result = rx.await;

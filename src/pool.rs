@@ -9,7 +9,9 @@ use std::{
 use anyhow::Result;
 use tracing::{debug, trace};
 
-use crate::TcpConnection;
+use crate::{TcpConnection, TcpConnectionConfig};
+
+const DEFAULT_CHAN_SIZE: usize = 10_000;
 
 pub struct ConnectionPool(Arc<PoolInner>);
 
@@ -24,6 +26,7 @@ struct PoolInner {
 /// Configuration for the connection pool
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
+    pub chan_size_per: usize,
     /// Maximum idle connections per downstream backend
     pub max_idle_per: usize,
     /// Maximum time a connection can be idle before cleanup
@@ -44,6 +47,7 @@ pub struct KeepaliveConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
+            chan_size_per: DEFAULT_CHAN_SIZE,
             max_idle_per: 10,
             max_idle_time: Duration::from_secs(300),
             cleanup_interval: Duration::from_secs(60),
@@ -121,9 +125,12 @@ impl ConnectionPool {
         debug!(%addr, "creating new connection");
         let conn = TcpConnection::new(
             addr,
-            self.0.config.keepalive.idle,
-            self.0.config.keepalive.interval,
-            self.0.config.max_in_flight_per,
+            TcpConnectionConfig {
+                chan_size: self.0.config.chan_size_per,
+                ka_idle: self.0.config.keepalive.idle,
+                ka_interval: self.0.config.keepalive.interval,
+                max_in_flight: self.0.config.max_in_flight_per,
+            },
         )
         .await?;
 
@@ -160,12 +167,12 @@ impl ConnectionPool {
             let mut idle_map = self.0.idle.write().unwrap();
             let connections = idle_map.entry(addr).or_default();
 
-            if connections.len() >= self.0.config.max_idle_per {
-                if let Some(old) = connections.pop_back() {
-                    trace!(%addr, "evicting oldest idle connection");
-                    // Explicitly shutdown before dropping
-                    // old.shutdown().await;
-                }
+            if connections.len() >= self.0.config.max_idle_per
+                && let Some(old) = connections.pop_back()
+            {
+                trace!(%addr, "evicting oldest idle connection");
+                // Explicitly shutdown before dropping
+                // old.shutdown().await;
             }
 
             connections.push_front(conn);
@@ -268,7 +275,7 @@ impl ConnectionPool {
         }
     }
     /// Get pool statistics
-    async fn stats(&self) -> PoolStats {
+    pub async fn stats(&self) -> PoolStats {
         let active_count: usize = self
             .0
             .active
@@ -287,7 +294,7 @@ impl ConnectionPool {
 }
 
 #[derive(Debug)]
-struct PoolStats {
+pub struct PoolStats {
     active_connections: usize,
     idle_connections: usize,
 }
