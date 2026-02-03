@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{info, level_filters::LevelFilter, warn};
+use tracing::{debug, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{
@@ -44,18 +44,15 @@ async fn main() -> Result<()> {
 
     let config = TcpConnectionConfig {
         chan_size: BUF_SIZE,
-        ka_idle: None,
-        ka_interval: None,
+        ka_idle: Some(1),
+        ka_interval: Some(1),
         max_in_flight: None,
     };
-    let conn = TcpConnection::new(addr, config).await?;
 
     let udp = Arc::new(tokio::net::UdpSocket::bind("[::]:9953").await?);
-    info!(
-        port = "9953",
-        ?addr,
-        "udp socket bound, tcp connection established"
-    );
+    info!(port = "9953", ?addr, "udp socket bound");
+
+    let mut conn: Option<Arc<TcpConnection>> = None;
 
     loop {
         let msg = match SerialMsg::recv(&udp).await {
@@ -65,10 +62,30 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        let reply_addr = msg.addr();
+
+        debug!(msg = ?msg.to_message());
+
+        if conn.as_ref().is_none_or(|existing| !existing.can_reuse()) {
+            match TcpConnection::new(addr, config).await {
+                Ok(new_conn) => {
+                    info!(?addr, "tcp connection established");
+                    conn = Some(new_conn);
+                }
+                Err(err) => {
+                    warn!(%err, "tcp connect failed");
+                    continue;
+                }
+            }
+        }
+
+        let Some(conn) = conn.clone() else {
+            warn!("tcp connection missing after connect attempt");
+            continue;
+        };
 
         tokio::spawn({
             let udp = udp.clone();
-            let conn = conn.clone();
             async move {
                 let (reply, rx) = tokio::sync::oneshot::channel();
                 let query = DnsQuery {
@@ -80,7 +97,9 @@ async fn main() -> Result<()> {
                     return;
                 }
                 match rx.await {
-                    Ok(reply) => {
+                    Ok(mut reply) => {
+                        // restore reply addr
+                        reply.set_addr(reply_addr);
                         if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
                             warn!(%err, "udp reply failed");
                         }

@@ -22,7 +22,7 @@ use tokio::{
     task::JoinSet,
 };
 // use tokio_util::{bytes::Bytes, task::TaskTracker};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::msg::SerialMsg;
 
@@ -282,6 +282,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
     loop {
         match SerialMsg::read(&mut recv, addr).await {
             Ok(mut msg) => {
+                trace!(id = msg.msg_id(), "received message over TCP");
                 // Extract DNS ID from response header (first 2 bytes)
                 if msg.bytes().len() < 12 {
                     // notify_io_error
@@ -291,7 +292,6 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                 let resp_id = msg.msg_id();
                 let (r, is_empty) = {
                     let mut lock = pending.lock().unwrap();
-
                     let entry = lock.remove(&resp_id);
                     let is_empty = lock.is_empty();
                     (entry, is_empty)
@@ -301,6 +301,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                     // restore original id
                     msg.replace_id(u16::to_be_bytes(resp.original_id));
 
+                    trace!(id = msg.msg_id(), "sending back msg over oneshot");
                     if let Err(err) = resp.reply.send(msg) {
                         warn!(
                             id = err.msg_id(),
@@ -311,6 +312,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                 }
                 // if there's nothing to read and we're closing
                 if is_empty && is_closing.load(Ordering::Relaxed) {
+                    debug!("TCP read half empty and closing");
                     break;
                 }
             }
@@ -346,6 +348,7 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
         let original_id = to_send.msg_id();
         to_send.replace_id(u16::to_be_bytes(next_id));
 
+        trace!(?next_id, "sending message over TCP");
         match to_send.write(&mut conn).await {
             Ok(_) => {
                 {
