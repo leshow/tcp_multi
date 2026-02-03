@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::{sync::Semaphore, time::interval};
 use tracing::{debug, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{
     EnvFilter,
@@ -41,6 +42,11 @@ async fn main() -> Result<()> {
     let addr = addr_str
         .parse()
         .with_context(|| format!("invalid tcp addr: {addr_str}"))?;
+    let max_in_flight: usize = std::env::args()
+        .nth(2)
+        .context("usage: tcp_multi <tcp_addr:port> <max_in_flight>")?
+        .parse()
+        .context("invalid max_in_flight")?;
 
     let config = TcpConnectionConfig {
         chan_size: BUF_SIZE,
@@ -53,6 +59,20 @@ async fn main() -> Result<()> {
     info!(port = "9953", ?addr, "udp socket bound");
 
     let mut conn: Option<Arc<TcpConnection>> = None;
+    let in_flight = Arc::new(Semaphore::new(max_in_flight));
+
+    {
+        let in_flight = in_flight.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let available = in_flight.available_permits();
+                let used = max_in_flight.saturating_sub(available);
+                info!(used, max_in_flight, "in-flight tasks");
+            }
+        });
+    }
 
     loop {
         let msg = match SerialMsg::recv(&udp).await {
@@ -84,6 +104,14 @@ async fn main() -> Result<()> {
             continue;
         };
 
+        let permit = match in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("semaphore closed, dropping task");
+                continue;
+            }
+        };
+
         tokio::spawn({
             let udp = udp.clone();
             async move {
@@ -108,6 +136,7 @@ async fn main() -> Result<()> {
                         warn!(%err, "oneshot tcp send failed");
                     }
                 };
+                drop(permit);
             }
         });
     }
