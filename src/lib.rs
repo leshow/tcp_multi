@@ -396,13 +396,18 @@ async fn tcpstream_connect(
     )?;
     // Enable TCP keepalive
     let mut keepalive = TcpKeepalive::new();
+    let mut ka_enable = false;
     if let Some(idle) = ka_idle {
+        ka_enable = true;
         keepalive = keepalive.with_time(Duration::from_secs(idle)); // Start probing after Xs idle
     }
     if let Some(interval) = ka_interval {
+        ka_enable = true;
         keepalive = keepalive.with_interval(Duration::from_secs(interval)); // Probe every Xs
     }
-    soc.set_tcp_keepalive(&keepalive)?;
+    if ka_enable {
+        soc.set_tcp_keepalive(&keepalive)?;
+    }
 
     soc.set_nonblocking(true)?;
     soc.set_tcp_nodelay(true)?;
