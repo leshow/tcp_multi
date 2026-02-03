@@ -69,7 +69,7 @@ pub struct TcpConnection {
     next_id: Arc<AtomicU16>,
     is_closing: Arc<AtomicBool>,
     // created_at: Instant,
-    last_activity: Arc<AtomicInstant>,
+    last_read: Arc<AtomicInstant>,
     // used to check SO_ERROR on socket
     read_fd: Option<RawFd>,
     max_in_flight: Option<usize>,
@@ -114,7 +114,7 @@ impl TcpConnection {
             read,
             addr,
             is_closing,
-            conn.last_activity.clone(),
+            conn.last_read.clone(),
             pending.clone(),
         ));
         conn.tasks.spawn(send_half(send, queued_rx, pending));
@@ -197,7 +197,7 @@ impl TcpConnection {
         }
 
         // skip socket check for recently-used
-        let last_activity = self.last_activity();
+        let last_activity = self.last_read();
         if now.duration_since(last_activity) < FRESH_THRESHOLD {
             // used recently
             return true;
@@ -224,8 +224,8 @@ impl TcpConnection {
     pub fn is_idle(&self) -> bool {
         self.pending.lock().unwrap().is_empty()
     }
-    pub fn last_activity(&self) -> Instant {
-        self.last_activity.load(Ordering::Relaxed)
+    pub fn last_read(&self) -> Instant {
+        self.last_read.load(Ordering::Relaxed)
     }
 }
 
@@ -258,7 +258,7 @@ fn new_conn(
         is_closing: is_closing.clone(),
         max_in_flight,
         // created_at: now,
-        last_activity: Arc::new(AtomicInstant::new(now)),
+        last_read: Arc::new(AtomicInstant::new(now)),
     };
     (is_closing, this)
 }
