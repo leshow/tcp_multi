@@ -14,7 +14,9 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use tcp_multi::{BUF_SIZE, DnsQuery, TcpConnection, TcpConnectionConfig, msg::SerialMsg};
+use tcp_multi::{
+    BUF_SIZE, DnsQuery, SendError, TcpConnection, TcpConnectionConfig, msg::SerialMsg,
+};
 
 const DEFAULT_LOG_FORMAT: &str = "pretty";
 
@@ -50,7 +52,6 @@ async fn main() -> Result<()> {
         .context("invalid max_in_flight")?;
 
     let config = TcpConnectionConfig {
-        chan_size: BUF_SIZE,
         ka_idle: Some(1),
         ka_interval: Some(1),
         max_in_flight: None,
@@ -123,13 +124,23 @@ async fn main() -> Result<()> {
             let udp = udp.clone();
             async move {
                 let (reply, rx) = tokio::sync::oneshot::channel();
-                let query = DnsQuery {
-                    to_send: msg,
-                    reply,
-                };
-                if let Err(err) = conn.send(query).await {
-                    warn!(%err, "tcp send failed");
-                    return;
+                match conn
+                    .send(DnsQuery {
+                        to_send: msg,
+                        reply,
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        // succeeded
+                    }
+                    Err(SendError::Closed { query }) => {
+                        // channel closed, so send on another conn
+                    }
+                    Err(err) => {
+                        // unrecoverable kind of error
+                        return;
+                    }
                 }
                 match rx.await {
                     Ok(mut reply) => {

@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
-    sync::{Mutex as TokioMutex, oneshot},
+    sync::{Mutex as AsyncMutex, oneshot},
     task::JoinSet,
 };
 // use tokio_util::{bytes::Bytes, task::TaskTracker};
@@ -32,9 +32,11 @@ pub mod pool;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TcpConnectionConfig {
-    pub chan_size: usize,
+    /// keepalive idle
     pub ka_idle: Option<u64>,
+    /// keepalive interval
     pub ka_interval: Option<u64>,
+    /// max in flight (default: unlimited)
     pub max_in_flight: Option<usize>,
 }
 
@@ -56,6 +58,14 @@ pub enum SendError {
     Io(#[from] std::io::Error),
 }
 
+pub type SendResult<T> = std::result::Result<T, SendError>;
+
+#[derive(Debug, Error)]
+pub enum TcpConnectionError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
 const MAX_ID: u16 = u16::MAX - 1;
 const FRESH_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -69,12 +79,9 @@ pub struct PendingResponse<T> {
 pub struct TcpConnection {
     addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
-    writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>>,
-    // @TODO remove individual Arcs and use Arc<TcpInner>?
-    next_id: Arc<AtomicU16>,
-    is_closing: Arc<AtomicBool>,
-    // created_at: Instant,
-    last_read: Arc<AtomicInstant>,
+    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    state: Arc<State>,
+    created_at: Instant,
     // used to check SO_ERROR on socket
     read_fd: Option<RawFd>,
     max_in_flight: Option<usize>,
@@ -82,10 +89,19 @@ pub struct TcpConnection {
     tasks: JoinSet<Result<()>>,
 }
 
+struct State {
+    next_id: AtomicU16,
+    is_closing: AtomicBool,
+    last_read: AtomicInstant,
+}
+
 type ResponseMap<T> = Arc<Mutex<HashMap<u16, T>>>;
 
 impl TcpConnection {
-    pub async fn new(addr: SocketAddr, config: TcpConnectionConfig) -> Result<Arc<Self>> {
+    pub async fn new(
+        addr: SocketAddr,
+        config: TcpConnectionConfig,
+    ) -> Result<Arc<Self>, TcpConnectionError> {
         let (read, send) = tcpstream_connect(addr, config.ka_idle, config.ka_interval)
             .await?
             .into_split();
@@ -101,24 +117,18 @@ impl TcpConnection {
         addr: SocketAddr,
         config: TcpConnectionConfig,
         read_fd: Option<RawFd>,
-    ) -> Result<Arc<Self>>
+    ) -> Result<Arc<Self>, TcpConnectionError>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>> =
-            TokioMutex::new(Box::new(send));
+        let writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>> =
+            AsyncMutex::new(Box::new(send));
 
-        let (is_closing, mut conn) =
-            new_conn(read_fd, addr, config.max_in_flight, &pending, writer);
-        conn.tasks.spawn(read_half(
-            read,
-            addr,
-            is_closing,
-            conn.last_read.clone(),
-            pending.clone(),
-        ));
+        let mut conn = new_conn(read_fd, addr, config.max_in_flight, pending.clone(), writer);
+        conn.tasks
+            .spawn(read_half(read, addr, conn.state.clone(), pending));
 
         Ok(Arc::new(conn))
     }
@@ -141,7 +151,7 @@ impl TcpConnection {
         if self.is_closing() {
             return Err(SendError::Closed { query });
         }
-        let next_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         if next_id >= MAX_ID {
             self.set_closing();
             return Err(SendError::Closed { query });
@@ -166,19 +176,19 @@ impl TcpConnection {
         if let Err(err) = to_send.write(&mut *writer).await {
             warn!(%err, "tcp write failed");
             self.set_closing();
-            self.drop_pending(next_id);
+            self.remove_pending(next_id);
             return Err(SendError::Io(err));
         }
         if let Err(err) = writer.flush().await {
             warn!(%err, "TCP flush failed");
             self.set_closing();
-            self.drop_pending(next_id);
+            self.remove_pending(next_id);
             return Err(SendError::Io(err));
         }
         Ok(())
     }
 
-    fn drop_pending(&self, id: u16) {
+    fn remove_pending(&self, id: u16) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(resp) = pending.remove(&id) {
             drop(resp.reply);
@@ -186,10 +196,10 @@ impl TcpConnection {
     }
 
     fn set_closing(&self) {
-        self.is_closing.swap(true, Ordering::Relaxed);
+        self.state.is_closing.swap(true, Ordering::Relaxed);
     }
     fn is_closing(&self) -> bool {
-        self.is_closing.load(Ordering::Relaxed)
+        self.state.is_closing.load(Ordering::Relaxed)
     }
     fn max_in_flight(&self) -> bool {
         if let Some(max) = self.max_in_flight {
@@ -238,7 +248,7 @@ impl TcpConnection {
     }
 
     fn reached_max_id(&self) -> bool {
-        self.next_id.load(Ordering::Relaxed) >= MAX_ID
+        self.state.next_id.load(Ordering::Relaxed) >= MAX_ID
     }
     pub fn is_healthy(&self) -> bool {
         if let Some(read_fd) = self.read_fd {
@@ -256,7 +266,13 @@ impl TcpConnection {
         self.pending.lock().unwrap().is_empty()
     }
     pub fn last_read(&self) -> Instant {
-        self.last_read.load(Ordering::Relaxed)
+        self.state.last_read.load(Ordering::Relaxed)
+    }
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
+    pub fn lifetime(&self) -> Duration {
+        self.created_at.duration_since(Instant::now())
     }
 }
 
@@ -274,31 +290,30 @@ fn new_conn(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
-    pending: &Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
-    writer: TokioMutex<Box<dyn AsyncWrite + Send + Unpin>>,
-) -> (Arc<AtomicBool>, TcpConnection) {
-    let is_closing = Arc::new(AtomicBool::new(false));
+    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
+    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+) -> TcpConnection {
     let now = Instant::now();
-    let this = TcpConnection {
+    TcpConnection {
         read_fd,
         addr,
-        pending: pending.clone(),
+        pending,
         tasks: JoinSet::new(),
         writer,
-        next_id: Arc::new(AtomicU16::new(0)),
-        is_closing: is_closing.clone(),
         max_in_flight,
-        // created_at: now,
-        last_read: Arc::new(AtomicInstant::new(now)),
-    };
-    (is_closing, this)
+        created_at: now,
+        state: Arc::new(State {
+            next_id: AtomicU16::new(0),
+            is_closing: AtomicBool::new(false),
+            last_read: AtomicInstant::new(now),
+        }),
+    }
 }
 
 async fn read_half<R: AsyncReadExt + Unpin>(
     mut recv: R,
     addr: SocketAddr,
-    is_closing: Arc<AtomicBool>,
-    last_activity: Arc<AtomicInstant>,
+    state: Arc<State>,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> Result<()> {
     loop {
@@ -310,7 +325,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                     // notify_io_error
                     continue;
                 }
-                last_activity.store(Instant::now(), Ordering::Relaxed);
+                state.last_read.store(Instant::now(), Ordering::Relaxed);
                 let resp_id = msg.msg_id();
                 let (r, is_empty) = {
                     let mut lock = pending.lock().unwrap();
@@ -333,7 +348,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                     }
                 }
                 // if there's nothing to read and we're closing
-                if is_empty && is_closing.load(Ordering::Relaxed) {
+                if is_empty && state.is_closing.load(Ordering::Relaxed) {
                     debug!("TCP read half empty and closing");
                     break;
                 }
@@ -341,7 +356,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
             Err(err) => {
                 warn!(%err, "tcp read half error");
                 // notify_io_error
-                is_closing.swap(true, Ordering::Relaxed);
+                state.is_closing.swap(true, Ordering::Relaxed);
                 break;
             }
         };
@@ -359,7 +374,7 @@ async fn tcpstream_connect(
     addr: SocketAddr,
     ka_idle: Option<u64>,
     ka_interval: Option<u64>,
-) -> Result<TcpStream> {
+) -> Result<TcpStream, TcpConnectionError> {
     let tfo_on = 1;
     let soc = socket2::Socket::new(
         if addr.is_ipv4() {
@@ -492,7 +507,6 @@ mod tests {
         let (read, write) = io::split(client);
         let addr = "127.0.0.1:53".parse().unwrap();
         let config = TcpConnectionConfig {
-            chan_size: BUF_SIZE,
             ka_idle: None,
             ka_interval: None,
             max_in_flight: max_flight,

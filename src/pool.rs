@@ -11,8 +11,6 @@ use tracing::{debug, trace};
 
 use crate::{TcpConnection, TcpConnectionConfig};
 
-const DEFAULT_CHAN_SIZE: usize = 10_000;
-
 pub struct ConnectionPool(Arc<PoolInner>);
 
 struct PoolInner {
@@ -26,7 +24,6 @@ struct PoolInner {
 /// Configuration for the connection pool
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
-    pub chan_size_per: usize,
     /// Maximum idle connections per downstream backend
     pub max_idle_per: usize,
     /// Maximum time a connection can be idle before cleanup
@@ -47,7 +44,6 @@ pub struct KeepaliveConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            chan_size_per: DEFAULT_CHAN_SIZE,
             max_idle_per: 10,
             max_idle_time: Duration::from_secs(300),
             cleanup_interval: Duration::from_secs(60),
@@ -126,7 +122,6 @@ impl ConnectionPool {
         let conn = TcpConnection::new(
             addr,
             TcpConnectionConfig {
-                chan_size: self.0.config.chan_size_per,
                 ka_idle: self.0.config.keepalive.idle,
                 ka_interval: self.0.config.keepalive.interval,
                 max_in_flight: self.0.config.max_in_flight_per,
