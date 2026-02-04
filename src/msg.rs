@@ -10,6 +10,8 @@ use tokio::{
 
 use std::{borrow::Borrow, io, net::SocketAddr};
 
+const BUF_SIZE: usize = 4096;
+
 // use crate::udp::UdpRecv;
 
 /// A message pulled from TCP or UDP and serialized to bytes, stored with a
@@ -147,7 +149,7 @@ impl SerialMsg {
     where
         S: Borrow<UdpSocket>,
     {
-        let mut buf = [0u8; crate::BUF_SIZE];
+        let mut buf = [0u8; crate::msg::BUF_SIZE];
         let (len, src) = stream.borrow().recv_from(&mut buf).await?;
         Ok(SerialMsg::new(buf[..len].to_vec(), src))
     }

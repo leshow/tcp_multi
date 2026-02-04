@@ -1,7 +1,6 @@
-pub const BUF_SIZE: usize = 4096;
-
 use std::{
     collections::HashMap,
+    marker::PhantomData,
     mem,
     net::SocketAddr,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
@@ -17,7 +16,10 @@ use socket2::TcpKeepalive;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpSocket, TcpStream},
+    net::{
+        TcpSocket, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinSet,
 };
@@ -37,6 +39,16 @@ pub struct TcpConnectionConfig {
     pub ka_interval: Option<u64>,
     /// max in flight (default: unlimited)
     pub max_in_flight: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionStats {
+    pub addr: SocketAddr,
+    pub queries_sent: u64,
+    pub pending_responses: usize,
+    pub current_query_id: u16,
+    pub age: Duration,
+    pub time_since_last_read: Duration,
 }
 
 #[derive(Debug)]
@@ -75,10 +87,10 @@ pub struct PendingResponse<T> {
     pub sent_at: Instant,
 }
 
-pub struct TcpConnection {
+pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
-    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    writer: AsyncMutex<W>,
     state: Arc<State>,
     created_at: Instant,
     // used to check SO_ERROR on socket
@@ -86,6 +98,7 @@ pub struct TcpConnection {
     max_in_flight: Option<usize>,
     // read/write tasks, dropping JoinSet will abort tasks
     tasks: JoinSet<std::io::Result<()>>,
+    _reader: PhantomData<R>,
 }
 
 struct State {
@@ -96,7 +109,7 @@ struct State {
 
 type ResponseMap<T> = Arc<Mutex<HashMap<u16, T>>>;
 
-impl TcpConnection {
+impl TcpConnection<OwnedReadHalf, OwnedWriteHalf> {
     pub async fn new(
         addr: SocketAddr,
         config: TcpConnectionConfig,
@@ -107,31 +120,13 @@ impl TcpConnection {
         let read_fd = read.as_ref().as_raw_fd();
         Self::from_split(read, send, addr, config, Some(read_fd))
     }
+}
 
-    // copied from new for testing
-    // New generic function to handle both real streams and test streams
-    fn from_split<R, W>(
-        read: R,
-        send: W,
-        addr: SocketAddr,
-        config: TcpConnectionConfig,
-        read_fd: Option<RawFd>,
-    ) -> Result<Arc<Self>, TcpConnectionError>
-    where
-        R: AsyncReadExt + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>> =
-            AsyncMutex::new(Box::new(send));
-
-        let mut conn = new_conn(read_fd, addr, config.max_in_flight, pending.clone(), writer);
-        conn.tasks
-            .spawn(read_half(read, addr, conn.state.clone(), pending));
-
-        Ok(Arc::new(conn))
-    }
-
+impl<R, W> TcpConnection<R, W>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -230,7 +225,8 @@ impl TcpConnection {
         true
         // self.is_healthy()
     }
-    /// Check if connection is usable - matches dnsdist's isConnectionUsable
+    /// Check if connection is usable, including if it was recently used
+    /// and if the socket has any read errors
     pub fn is_usable(&self, now: Instant) -> bool {
         if !self.can_reuse() {
             return false;
@@ -273,25 +269,44 @@ impl TcpConnection {
     pub fn lifetime(&self) -> Duration {
         self.created_at.duration_since(Instant::now())
     }
+    pub fn stats(&self) -> ConnectionStats {
+        let now = Instant::now();
+        ConnectionStats {
+            addr: self.addr,
+            queries_sent: self.state.next_id.load(Ordering::Relaxed) as u64,
+            pending_responses: self.pending.lock().unwrap().len(),
+            current_query_id: self.state.next_id.load(Ordering::Relaxed),
+            age: now.duration_since(self.created_at),
+            time_since_last_read: now.duration_since(self.last_read()),
+        }
+    }
+    // copied from new for testing
+    // New generic function to handle both real streams and test streams
+    fn from_split(
+        read: R,
+        send: W,
+        addr: SocketAddr,
+        config: TcpConnectionConfig,
+        read_fd: Option<RawFd>,
+    ) -> Result<Arc<Self>, TcpConnectionError> {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+
+        let send = AsyncMutex::new(send);
+        let mut conn = new_conn(read_fd, addr, config.max_in_flight, pending.clone(), send);
+        conn.tasks
+            .spawn(read_half(read, addr, conn.state.clone(), pending));
+
+        Ok(Arc::new(conn))
+    }
 }
 
-// #[derive(Debug)]
-// pub struct ConnectionStats {
-//     pub addr: SocketAddr,
-//     pub queries_sent: u64,
-//     pub pending_responses: usize,
-//     pub current_query_id: u16,
-//     pub age: Duration,
-//     pub last_activity: Duration,
-// }
-
-fn new_conn(
+fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
     pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
-    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
-) -> TcpConnection {
+    writer: AsyncMutex<W>,
+) -> TcpConnection<R, W> {
     let now = Instant::now();
     TcpConnection {
         read_fd,
@@ -301,6 +316,7 @@ fn new_conn(
         writer,
         max_in_flight,
         created_at: now,
+        _reader: PhantomData,
         state: Arc::new(State {
             next_id: AtomicU16::new(0),
             is_closing: AtomicBool::new(false),
@@ -498,7 +514,11 @@ mod tests {
 
     async fn test_conn(
         max_flight: Option<usize>,
-    ) -> (Arc<TcpConnection>, tokio::io::DuplexStream, SocketAddr) {
+    ) -> (
+        Arc<TcpConnection<io::ReadHalf<DuplexStream>, io::WriteHalf<DuplexStream>>>,
+        tokio::io::DuplexStream,
+        SocketAddr,
+    ) {
         // use duplex for testing b/c it's all in memory
         const BUF_SIZE: usize = 4096;
         let (client, server) = io::duplex(BUF_SIZE);
