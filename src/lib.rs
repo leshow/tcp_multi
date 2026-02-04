@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
 use atomic_time::AtomicInstant;
 use socket2::TcpKeepalive;
 use thiserror::Error;
@@ -86,7 +85,7 @@ pub struct TcpConnection {
     read_fd: Option<RawFd>,
     max_in_flight: Option<usize>,
     // read/write tasks, dropping JoinSet will abort tasks
-    tasks: JoinSet<Result<()>>,
+    tasks: JoinSet<std::io::Result<()>>,
 }
 
 struct State {
@@ -136,7 +135,7 @@ impl TcpConnection {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    pub async fn send(&self, query: DnsQuery<SerialMsg>) -> std::result::Result<(), SendError> {
+    pub async fn send(&self, query: DnsQuery<SerialMsg>) -> Result<(), SendError> {
         // should this be done in the pool and not on send?
         if !self.can_reuse() {
             self.set_closing();
@@ -153,6 +152,7 @@ impl TcpConnection {
         }
         let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         if next_id >= MAX_ID {
+            // exhausted IDs, return an error so a fresh connection is used
             self.set_closing();
             return Err(SendError::Closed { query });
         }
@@ -161,6 +161,12 @@ impl TcpConnection {
         let original_id = to_send.msg_id();
         to_send.replace_id(u16::to_be_bytes(next_id));
 
+        if let Err(err) = to_send.write(&mut *writer).await {
+            warn!(%err, "tcp write failed");
+            self.set_closing();
+            return Err(SendError::Io(err));
+        }
+        // insert entry
         {
             let mut lock = self.pending.lock().unwrap();
             lock.insert(
@@ -172,19 +178,13 @@ impl TcpConnection {
                 },
             );
         }
-
-        if let Err(err) = to_send.write(&mut *writer).await {
-            warn!(%err, "tcp write failed");
-            self.set_closing();
-            self.remove_pending(next_id);
-            return Err(SendError::Io(err));
-        }
         if let Err(err) = writer.flush().await {
             warn!(%err, "TCP flush failed");
             self.set_closing();
             self.remove_pending(next_id);
             return Err(SendError::Io(err));
         }
+
         Ok(())
     }
 
@@ -194,7 +194,6 @@ impl TcpConnection {
             drop(resp.reply);
         }
     }
-
     fn set_closing(&self) {
         self.state.is_closing.swap(true, Ordering::Relaxed);
     }
@@ -315,7 +314,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
     addr: SocketAddr,
     state: Arc<State>,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
-) -> Result<()> {
+) -> std::io::Result<()> {
     loop {
         match SerialMsg::read(&mut recv, addr).await {
             Ok(mut msg) => {

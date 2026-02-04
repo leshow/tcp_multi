@@ -14,9 +14,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use tcp_multi::{
-    BUF_SIZE, DnsQuery, SendError, TcpConnection, TcpConnectionConfig, msg::SerialMsg,
-};
+use tcp_multi::{DnsQuery, SendError, TcpConnection, TcpConnectionConfig, msg::SerialMsg};
 
 const DEFAULT_LOG_FORMAT: &str = "pretty";
 
