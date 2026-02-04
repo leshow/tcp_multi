@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     marker::PhantomData,
     mem,
     net::SocketAddr,
@@ -101,6 +102,18 @@ pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     _reader: PhantomData<R>,
 }
 
+impl<R, W> fmt::Debug for TcpConnection<R, W>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpConnection")
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
 struct State {
     next_id: AtomicU16,
     is_closing: AtomicBool,
@@ -156,7 +169,7 @@ where
         let original_id = to_send.msg_id();
         to_send.replace_id(u16::to_be_bytes(next_id));
 
-        if let Err(err) = to_send.write(&mut *writer).await {
+        if let Err(err) = to_send.writev(&mut *writer).await {
             warn!(%err, "tcp write failed");
             self.set_closing();
             return Err(SendError::Io(err));

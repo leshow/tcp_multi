@@ -8,7 +8,11 @@ use tokio::{
     net::UdpSocket,
 };
 
-use std::{borrow::Borrow, io, net::SocketAddr};
+use std::{
+    borrow::Borrow,
+    io::{self, ErrorKind, IoSlice},
+    net::SocketAddr,
+};
 
 const BUF_SIZE: usize = 4096;
 
@@ -140,6 +144,42 @@ impl SerialMsg {
         stream.write_all(&self.message).await?;
 
         Ok(len)
+    }
+
+    /// write a `SerialMsg` to any `AsyncWriteExt`
+    ///
+    /// Cancel-safety: not cancel-safe. uses internal state while writing to `TcpStream`
+    pub async fn writev<S>(&self, stream: &mut S) -> io::Result<usize>
+    where
+        S: Unpin + AsyncWriteExt,
+    {
+        let byte_len = (self.message.len() as u16).to_be_bytes();
+        let mut bufs = &mut [
+            IoSlice::new(&byte_len),
+            IoSlice::new(self.message.as_slice()),
+        ][..];
+
+        /*
+         * @TODO: When Tokio introduces `write_all_vectored` to `TcpStream` it can replace the rest of this fn.
+         * There is a PR to add `write_all_vectored`: https://github.com/tokio-rs/tokio/pull/7768
+         */
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut i = 0;
+
+        // send
+        while i < len {
+            let written = stream.write_vectored(bufs).await?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write dns message to tcp socket",
+                ));
+            }
+            IoSlice::advance_slices(&mut bufs, written);
+            i += written;
+        }
+
+        Ok(i)
     }
 
     /// Receive a `SerialMsg` from any new `UdpRecv`
