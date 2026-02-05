@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::time::Instant;
+use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{Context, Result};
-use tokio::{sync::Semaphore, time::interval};
+use anyhow::{Context, Result, bail};
+use tokio::{net::TcpStream, sync::Semaphore, time::interval};
 use tracing::{debug, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{
     EnvFilter,
@@ -17,6 +17,19 @@ use tracing_subscriber::{
 use tcp_multi::{DnsQuery, SendError, TcpConnection, TcpConnectionConfig, msg::SerialMsg};
 
 const DEFAULT_LOG_FORMAT: &str = "pretty";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportMode {
+    TcpConnection,
+    TcpStreamPerMessage,
+}
+
+#[derive(Debug)]
+struct CliArgs {
+    addr: SocketAddr,
+    max_in_flight: usize,
+    mode: TransportMode,
+}
 
 #[derive(Clone, Copy)]
 pub struct EnvVars {
@@ -33,21 +46,56 @@ impl Default for EnvVars {
     }
 }
 
+fn usage() -> &'static str {
+    "usage: tcp_multi <tcp_addr:port> <max_in_flight> [--stream|--multi]"
+}
+
+fn parse_args() -> Result<CliArgs> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let args = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+    let (addr_str, max_in_flight_str, mode) = match args.as_slice() {
+        ["-h"] | ["--help"] => bail!(usage()),
+        [addr, max] | [addr, max, "--multi"] => (addr, max, TransportMode::TcpConnection),
+        [addr, max, "--stream"] => (addr, max, TransportMode::TcpStreamPerMessage),
+        _ => bail!(usage()),
+    };
+
+    let addr = addr_str
+        .parse()
+        .with_context(|| format!("invalid tcp addr: {addr_str}"))?;
+    let max_in_flight = max_in_flight_str.parse().context("invalid max_in_flight")?;
+
+    Ok(CliArgs {
+        addr,
+        max_in_flight,
+        mode,
+    })
+}
+
+async fn send_over_new_stream(
+    addr: SocketAddr,
+    msg: SerialMsg,
+    reply_addr: SocketAddr,
+    udp: Arc<tokio::net::UdpSocket>,
+) -> Result<()> {
+    let mut stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    msg.write(&mut stream).await?;
+
+    let mut reply = SerialMsg::read(&mut stream, addr).await?;
+    reply.set_addr(reply_addr);
+    udp.send_to(reply.bytes(), reply.addr()).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(None)?;
 
-    let addr_str = std::env::args()
-        .nth(1)
-        .context("usage: tcp_multi <tcp_addr:port>")?;
-    let addr = addr_str
-        .parse()
-        .with_context(|| format!("invalid tcp addr: {addr_str}"))?;
-    let total_in_flight: usize = std::env::args()
-        .nth(2)
-        .context("usage: tcp_multi <tcp_addr:port> <max_in_flight>")?
-        .parse()
-        .context("invalid max_in_flight")?;
+    let cli = parse_args()?;
+    let addr = cli.addr;
+    let total_in_flight = cli.max_in_flight;
+    let mode = cli.mode;
 
     let config = TcpConnectionConfig {
         ka_idle: Some(1),
@@ -87,29 +135,6 @@ async fn main() -> Result<()> {
         let reply_addr = msg.addr();
 
         debug!(msg = ?msg.to_message());
-
-        if conn
-            .as_ref()
-            // !can_reuse()
-            .is_none_or(|existing| !existing.is_usable(Instant::now()))
-        {
-            match TcpConnection::new(addr, config).await {
-                Ok(new_conn) => {
-                    info!(?addr, "tcp connection established");
-                    conn = Some(new_conn);
-                }
-                Err(err) => {
-                    warn!(%err, "tcp connect failed");
-                    continue;
-                }
-            }
-        }
-
-        let Some(conn) = conn.clone() else {
-            warn!("tcp connection missing after connect attempt");
-            continue;
-        };
-
         let permit = match in_flight.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -118,43 +143,80 @@ async fn main() -> Result<()> {
             }
         };
 
-        tokio::spawn({
-            let udp = udp.clone();
-            async move {
-                let (reply, rx) = tokio::sync::oneshot::channel();
-                match conn
-                    .send(DnsQuery {
-                        to_send: msg,
-                        reply,
-                    })
-                    .await
+        match mode {
+            TransportMode::TcpConnection => {
+                if conn
+                    .as_ref()
+                    // !can_reuse()
+                    .is_none_or(|existing| !existing.is_usable(Instant::now()))
                 {
-                    Ok(_) => {
-                        // succeeded
-                    }
-                    Err(SendError::Closed { query }) => {
-                        // channel closed, so send on another conn
-                    }
-                    Err(err) => {
-                        // unrecoverable kind of error
-                        return;
-                    }
-                }
-                match rx.await {
-                    Ok(mut reply) => {
-                        // restore reply addr
-                        reply.set_addr(reply_addr);
-                        if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
-                            warn!(%err, "udp reply failed");
+                    match TcpConnection::new(addr, config).await {
+                        Ok(new_conn) => {
+                            info!(?addr, "tcp connection established");
+                            conn = Some(new_conn);
+                        }
+                        Err(err) => {
+                            warn!(%err, "tcp connect failed");
+                            continue;
                         }
                     }
-                    Err(err) => {
-                        warn!(%err, "oneshot tcp send failed");
-                    }
+                }
+
+                let Some(conn) = conn.clone() else {
+                    warn!("tcp connection missing after connect attempt");
+                    continue;
                 };
-                drop(permit);
+
+                tokio::spawn({
+                    let udp = udp.clone();
+                    async move {
+                        let (reply, rx) = tokio::sync::oneshot::channel();
+                        match conn
+                            .send(DnsQuery {
+                                to_send: msg,
+                                reply,
+                            })
+                            .await
+                        {
+                            Ok(_) => {
+                                // succeeded
+                            }
+                            Err(SendError::Closed { query }) => {
+                                // channel closed, so send on another conn
+                            }
+                            Err(err) => {
+                                // unrecoverable kind of error
+                                return;
+                            }
+                        }
+                        match rx.await {
+                            Ok(mut reply) => {
+                                // restore reply addr
+                                reply.set_addr(reply_addr);
+                                if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
+                                    warn!(%err, "udp reply failed");
+                                }
+                            }
+                            Err(err) => {
+                                warn!(%err, "oneshot tcp send failed");
+                            }
+                        };
+                        drop(permit);
+                    }
+                });
             }
-        });
+            TransportMode::TcpStreamPerMessage => {
+                tokio::spawn({
+                    let udp = udp.clone();
+                    async move {
+                        if let Err(err) = send_over_new_stream(addr, msg, reply_addr, udp).await {
+                            warn!(%err, "tcpstream per-message failed");
+                        }
+                        drop(permit);
+                    }
+                });
+            }
+        }
     }
 }
 
