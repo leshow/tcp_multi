@@ -1,0 +1,15 @@
+services:
+  dnsdist:
+    image: powerdns/dnsdist-19
+    container_name: dnsdist
+    command:
+      - "-C"
+      - "/etc/dnsdist/dnsdist.conf"
+    ports:
+      # - "53:53/udp"
+      # - "53:53/tcp"
+      - "1234:53/tcp"
+      - "1234:53/udp"
+    volumes:
+      - "${PWD}/dnsdist.conf:/etc/dnsdist/dnsdist.conf:ro"
+    restart: unless-stopped

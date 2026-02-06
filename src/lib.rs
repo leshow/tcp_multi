@@ -25,7 +25,7 @@ use tokio::{
     task::JoinSet,
 };
 // use tokio_util::{bytes::Bytes, task::TaskTracker};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::msg::SerialMsg;
 
@@ -100,6 +100,11 @@ pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     // read/write tasks, dropping JoinSet will abort tasks
     tasks: JoinSet<std::io::Result<()>>,
     _reader: PhantomData<R>,
+}
+impl<R, W> Drop for TcpConnection<R, W> {
+    fn drop(&mut self) {
+        info!("dropped tcp connection");
+    }
 }
 
 impl<R, W> fmt::Debug for TcpConnection<R, W>
@@ -186,12 +191,12 @@ where
                 },
             );
         }
-        if let Err(err) = writer.flush().await {
-            warn!(%err, "TCP flush failed");
-            self.set_closing();
-            self.remove_pending(next_id);
-            return Err(SendError::Io(err));
-        }
+        // if let Err(err) = writer.flush().await {
+        //     warn!(%err, "TCP flush failed");
+        //     self.set_closing();
+        //     self.remove_pending(next_id);
+        //     return Err(SendError::Io(err));
+        // }
 
         Ok(())
     }
