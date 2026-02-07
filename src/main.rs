@@ -128,17 +128,17 @@ async fn main() -> Result<()> {
         let msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
             Err(err) => {
-                warn!(%err, "udp recv failed");
+                debug!(%err, "udp recv failed");
                 continue;
             }
         };
         let reply_addr = msg.addr();
 
-        debug!(msg = ?msg.to_message());
+        trace!(msg = ?msg.to_message());
         let permit = match in_flight.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                warn!("semaphore closed, dropping task");
+                debug!("semaphore closed, dropping task");
                 continue;
             }
         };
