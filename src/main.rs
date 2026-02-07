@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use tokio::{net::TcpStream, sync::Semaphore, time::interval};
-use tracing::{debug, info, level_filters::LevelFilter, warn};
+use tracing::{debug, info, level_filters::LevelFilter, trace, warn};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{
