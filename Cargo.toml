@@ -16,3 +16,7 @@ tokio-util = { version = "0.7.18", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { features = ["env-filter", "json"], version = "0.3" }
 tracing-futures = "0.2.5"
+
+[features]
+default = ["locking"]
+locking = []

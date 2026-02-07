@@ -24,7 +24,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinSet,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::msg::SerialMsg;
 
@@ -87,9 +87,29 @@ pub struct PendingResponse<T> {
     pub sent_at: Instant,
 }
 
+#[cfg(not(feature = "locking"))]
+#[derive(Debug)]
+pub struct PendingSend<T> {
+    pub to_send: T,
+    pub next_id: u16,
+    pub reply: oneshot::Sender<T>,
+}
+
+#[cfg(not(feature = "locking"))]
+impl<T> PendingSend<T> {
+    pub fn new(to_send: T, next_id: u16, reply: oneshot::Sender<T>) -> Self {
+        Self {
+            to_send,
+            reply,
+            next_id,
+        }
+    }
+}
+
 pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     addr: SocketAddr,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
+    #[cfg(feature = "locking")]
     writer: AsyncMutex<W>,
     state: Arc<State>,
     created_at: Instant,
@@ -98,6 +118,10 @@ pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     max_in_flight: Option<usize>,
     // read/write tasks, dropping JoinSet will abort tasks
     tasks: JoinSet<std::io::Result<()>>,
+    #[cfg(not(feature = "locking"))]
+    queued_tx: tokio::sync::mpsc::Sender<PendingSend<SerialMsg>>,
+    #[cfg(not(feature = "locking"))]
+    _writer: PhantomData<W>,
     _reader: PhantomData<R>,
 }
 
@@ -158,47 +182,74 @@ where
             // notify err? msg too small
             return Err(SendError::MessageTooSmall);
         }
-        let mut writer = self.writer.lock().await;
-        // could have closed after lock
-        if self.is_closing() {
-            return Err(SendError::Closed { query });
-        }
-        let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-        // if next_id >= MAX_ID {
-        //     // exhausted IDs, return an error so a fresh connection is used
-        //     self.set_closing();
-        //     return Err(SendError::Closed { query });
-        // }
-
-        let DnsQuery { mut to_send, reply } = query;
-        let original_id = to_send.msg_id();
-        to_send.replace_id(u16::to_be_bytes(next_id));
-        // insert entry
+        #[cfg(feature = "locking")]
         {
-            let mut lock = self.pending.lock().unwrap();
-            lock.insert(
-                next_id,
-                PendingResponse {
-                    original_id,
+            let mut writer = self.writer.lock().await;
+            // could have closed after lock
+            if self.is_closing() {
+                return Err(SendError::Closed { query });
+            }
+            let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+            if next_id >= MAX_ID {
+                // exhausted IDs, return an error so a fresh connection is used
+                self.set_closing();
+                return Err(SendError::Closed { query });
+            }
+
+            let DnsQuery { mut to_send, reply } = query;
+            let original_id = to_send.msg_id();
+            to_send.replace_id(u16::to_be_bytes(next_id));
+            // insert entry
+            {
+                let mut lock = self.pending.lock().unwrap();
+                lock.insert(
+                    next_id,
+                    PendingResponse {
+                        original_id,
+                        reply,
+                        sent_at: Instant::now(),
+                    },
+                );
+            }
+
+            if let Err(err) = to_send.writev(&mut *writer).await {
+                warn!(%err, "tcp write failed");
+                self.set_closing();
+                self.remove_pending(next_id);
+                return Err(SendError::Io(err));
+            }
+
+            if let Err(err) = writer.flush().await {
+                warn!(%err, "TCP flush failed");
+                self.set_closing();
+                self.remove_pending(next_id);
+                return Err(SendError::Io(err));
+            }
+        }
+
+        #[cfg(not(feature = "locking"))]
+        {
+            let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+            if next_id >= MAX_ID {
+                // exhausted IDs, return an error so a fresh connection is used
+                self.set_closing();
+                return Err(SendError::Closed { query });
+            }
+
+            let DnsQuery { mut to_send, reply } = query;
+            if let Err(err) = self
+                .queued_tx
+                .send(PendingSend {
+                    to_send,
+                    next_id,
                     reply,
-                    sent_at: Instant::now(),
-                },
-            );
+                })
+                .await
+            {
+                warn!(%err, "TCP pending queue dropped, setting connection to closing");
+                self.set_closing();
+            }
         }
-        if let Err(err) = to_send.writev(&mut *writer).await {
-            warn!(%err, "tcp write failed");
-            self.set_closing();
-            self.remove_pending(next_id);
-            return Err(SendError::Io(err));
-        }
-
-        if let Err(err) = writer.flush().await {
-            warn!(%err, "TCP flush failed");
-            self.set_closing();
-            self.remove_pending(next_id);
-            return Err(SendError::Io(err));
-        }
-
         Ok(())
     }
 
@@ -280,7 +331,7 @@ where
         self.pending.lock().unwrap().is_empty()
     }
     pub fn last_read(&self) -> Instant {
-        self.state.last_read.load(Ordering::Relaxed)
+        self.state.last_read.load(Ordering::Acquire)
     }
     pub fn created_at(&self) -> Instant {
         self.created_at
@@ -310,8 +361,28 @@ where
     ) -> Result<Arc<Self>, TcpConnectionError> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
 
-        let send = AsyncMutex::new(send);
-        let mut conn = new_conn(read_fd, addr, config.max_in_flight, pending.clone(), send);
+        let mut conn = {
+            #[cfg(feature = "locking")]
+            {
+                let send = AsyncMutex::new(send);
+                new_conn(read_fd, addr, config.max_in_flight, pending.clone(), send)
+            }
+            #[cfg(not(feature = "locking"))]
+            {
+                let (queued_tx, queued_rx) = tokio::sync::mpsc::channel(10_0000);
+                let mut conn = new_conn(
+                    read_fd,
+                    addr,
+                    config.max_in_flight,
+                    pending.clone(),
+                    queued_tx,
+                );
+
+                conn.tasks
+                    .spawn(send_half(send, queued_rx, pending.clone()));
+                conn
+            }
+        };
         conn.tasks
             .spawn(read_half(read, addr, conn.state.clone(), pending));
 
@@ -319,6 +390,7 @@ where
     }
 }
 
+#[cfg(feature = "locking")]
 fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
@@ -344,6 +416,82 @@ fn new_conn<R, W>(
     }
 }
 
+#[cfg(not(feature = "locking"))]
+fn new_conn<R, W>(
+    read_fd: Option<RawFd>,
+    addr: SocketAddr,
+    max_in_flight: Option<usize>,
+    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
+    queued_tx: tokio::sync::mpsc::Sender<PendingSend<SerialMsg>>,
+) -> TcpConnection<R, W> {
+    let now = Instant::now();
+    TcpConnection {
+        read_fd,
+        addr,
+        pending,
+        tasks: JoinSet::new(),
+        max_in_flight,
+        created_at: now,
+        queued_tx,
+        _reader: PhantomData,
+        _writer: PhantomData,
+        state: Arc::new(State {
+            next_id: AtomicU16::new(0),
+            is_closing: AtomicBool::new(false),
+            last_read: AtomicInstant::new(now),
+        }),
+    }
+}
+
+#[cfg(not(feature = "locking"))]
+async fn send_half<W: AsyncWriteExt + Unpin>(
+    mut conn: W,
+    mut queued_msgs: tokio::sync::mpsc::Receiver<PendingSend<SerialMsg>>,
+    pending: ResponseMap<PendingResponse<SerialMsg>>,
+) -> std::io::Result<()> {
+    while let Some(PendingSend {
+        mut to_send,
+        reply,
+        next_id,
+    }) = queued_msgs.recv().await
+    {
+        // swap id
+        let original_id = to_send.msg_id();
+        to_send.replace_id(u16::to_be_bytes(next_id));
+
+        trace!(?next_id, "sending message over TCP");
+        match to_send.writev(&mut conn).await {
+            Ok(_) => {
+                {
+                    let mut lock = pending.lock().unwrap();
+                    // insert next_id and for recv
+                    lock.insert(
+                        next_id,
+                        PendingResponse {
+                            original_id,
+                            reply,
+                            sent_at: Instant::now(),
+                        },
+                    );
+                    drop(lock);
+                }
+                if let Err(err) = conn.flush().await {
+                    warn!(%err, "TCP flush failed");
+                    // notify_io_error?
+                    break;
+                }
+            }
+            Err(err) => {
+                // notify_io_error
+                warn!(%err, "send half error tcp");
+                break;
+            }
+        }
+    }
+    debug!("TCP send half exited");
+    // will drop queued_msgs and Sender will fail
+    Ok(())
+}
 async fn read_half<R: AsyncReadExt + Unpin>(
     mut recv: R,
     addr: SocketAddr,
@@ -359,7 +507,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                     // notify_io_error
                     continue;
                 }
-                state.last_read.store(Instant::now(), Ordering::Relaxed);
+                state.last_read.store(Instant::now(), Ordering::Release);
                 let resp_id = msg.msg_id();
                 let (r, is_empty) = {
                     let mut lock = pending.lock().unwrap();
@@ -390,7 +538,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
             Err(err) => {
                 warn!(%err, "tcp read half error");
                 // notify_io_error
-                state.is_closing.swap(true, Ordering::Relaxed);
+                state.is_closing.swap(true, Ordering::AcqRel);
                 break;
             }
         };

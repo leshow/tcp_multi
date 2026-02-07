@@ -91,6 +91,11 @@ async fn send_over_new_stream(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(None)?;
+    #[cfg(feature = "locking")]
+    info!("started with locking");
+
+    #[cfg(not(feature = "locking"))]
+    info!("started with write task");
 
     let cli = parse_args()?;
     let addr = cli.addr;
@@ -149,6 +154,7 @@ async fn main() -> Result<()> {
                     .as_ref()
                     // !can_reuse()
                     .is_none_or(|existing| !existing.is_usable(Instant::now()))
+                // .is_none_or(|existing| !existing.can_reuse())
                 {
                     match TcpConnection::new(addr, config).await {
                         Ok(new_conn) => {
