@@ -24,7 +24,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, oneshot},
     task::JoinSet,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::msg::SerialMsg;
 
@@ -483,7 +483,7 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
             }
             Err(err) => {
                 // notify_io_error
-                warn!(%err, "send half error tcp");
+                debug!(%err, "send half error tcp");
                 break;
             }
         }
@@ -528,16 +528,17 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                             "TCP: sending over oneshot failed (likely reason: got response back for an already dropped message)"
                         )
                     }
+                } else {
+                    warn!("received unknown message not in pending map");
                 }
                 // if there's nothing to read and we're closing
-                if is_empty && state.is_closing.load(Ordering::Relaxed) {
+                if is_empty && state.is_closing.load(Ordering::Acquire) {
                     debug!("TCP read half empty and closing");
                     break;
                 }
             }
             Err(err) => {
                 warn!(%err, "tcp read half error");
-                // notify_io_error
                 state.is_closing.swap(true, Ordering::AcqRel);
                 break;
             }

@@ -2,6 +2,7 @@ use std::time::Instant;
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use tcp_multi::pool::{ConnectionPool, PoolConfig};
 use tokio::{net::TcpStream, sync::Semaphore, time::interval};
 use tracing::{debug, info, level_filters::LevelFilter, trace, warn};
 use tracing_subscriber::{
@@ -129,6 +130,13 @@ async fn main() -> Result<()> {
         });
     }
 
+    let mut pool = Arc::new(ConnectionPool::new(
+        addr,
+        PoolConfig {
+            max_idle_per: 10,
+            ..Default::default()
+        },
+    ));
     loop {
         let msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
@@ -150,32 +158,35 @@ async fn main() -> Result<()> {
 
         match mode {
             TransportMode::TcpConnection => {
-                if conn
-                    .as_ref()
-                    // !can_reuse()
-                    .is_none_or(|existing| !existing.is_usable(Instant::now()))
-                // .is_none_or(|existing| !existing.can_reuse())
-                {
-                    match TcpConnection::new(addr, config).await {
-                        Ok(new_conn) => {
-                            info!(?addr, "tcp connection established");
-                            conn = Some(new_conn);
-                        }
-                        Err(err) => {
-                            warn!(%err, "tcp connect failed");
-                            continue;
-                        }
-                    }
-                }
+                // if conn
+                //     .as_ref()
+                //     // !can_reuse()
+                //     .is_none_or(|existing| !existing.is_usable(Instant::now()))
+                // // .is_none_or(|existing| !existing.can_reuse())
+                // {
+                //     match TcpConnection::new(addr, config).await {
+                //         Ok(new_conn) => {
+                //             info!(?addr, "tcp connection established");
+                //             conn = Some(new_conn);
+                //         }
+                //         Err(err) => {
+                //             warn!(%err, "tcp connect failed");
+                //             continue;
+                //         }
+                //     }
+                // }
 
-                let Some(conn) = conn.clone() else {
-                    warn!("tcp connection missing after connect attempt");
-                    continue;
-                };
+                // let Some(conn) = conn.clone() else {
+                //     warn!("tcp connection missing after connect attempt");
+                //     continue;
+                // };
 
                 tokio::spawn({
                     let udp = udp.clone();
+                    let pool = pool.clone();
                     async move {
+                        let conn = pool.get_connection().await?;
+
                         let (reply, rx) = tokio::sync::oneshot::channel();
                         match conn
                             .send(DnsQuery {
@@ -189,10 +200,17 @@ async fn main() -> Result<()> {
                             }
                             Err(SendError::Closed { query }) => {
                                 // channel closed, so send on another conn
+                                trace!("tried to send on closed channel, trying new connection");
+                                pool.remove_connection(&conn);
+                                drop(conn);
+                                let conn = pool.get_connection().await?;
+                                if let Err(err) = conn.send(query).await {
+                                    warn!(%err, "failed to send twice now, giving up");
+                                }
                             }
                             Err(err) => {
                                 // unrecoverable kind of error
-                                return;
+                                return Err(err.into());
                             }
                         }
                         match rx.await {
@@ -208,6 +226,7 @@ async fn main() -> Result<()> {
                             }
                         };
                         drop(permit);
+                        Ok::<_, anyhow::Error>(())
                     }
                 });
             }
