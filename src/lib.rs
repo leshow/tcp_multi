@@ -7,7 +7,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -147,6 +147,7 @@ struct State {
     next_id: AtomicU16,
     is_closing: AtomicBool,
     last_read: AtomicInstant,
+    pending_count: AtomicUsize,
 }
 
 type ResponseMap<T> = Arc<Mutex<HashMap<u16, T>>>;
@@ -155,7 +156,7 @@ impl TcpConnection<OwnedReadHalf, OwnedWriteHalf> {
     pub async fn new(
         addr: SocketAddr,
         config: TcpConnectionConfig,
-    ) -> Result<Arc<Self>, TcpConnectionError> {
+    ) -> Result<Self, TcpConnectionError> {
         let (read, send) = tcpstream_connect(addr, config.ka_idle, config.ka_interval)
             .await?
             .into_split();
@@ -210,6 +211,7 @@ where
                         sent_at: Instant::now(),
                     },
                 );
+                self.state.pending_count.fetch_add(1, Ordering::Release);
             }
 
             if let Err(err) = to_send.writev(&mut *writer).await {
@@ -256,18 +258,23 @@ where
     fn remove_pending(&self, id: u16) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(resp) = pending.remove(&id) {
+            self.state.pending_count.fetch_sub(1, Ordering::Release);
             drop(resp.reply);
         }
     }
+    // pub fn set_closing(&self) {
+    //     self.state.is_closing.swap(true, Ordering::AcqRel);
+    // }
     pub fn set_closing(&self) {
-        self.state.is_closing.swap(true, Ordering::AcqRel);
+        let old = self.state.is_closing.swap(true, Ordering::AcqRel);
+        debug!(old_closing = old, "set_closing called"); // Add this debug
     }
     fn is_closing(&self) -> bool {
         self.state.is_closing.load(Ordering::Acquire)
     }
     fn max_in_flight(&self) -> bool {
         if let Some(max) = self.max_in_flight {
-            let pending = { self.pending.lock().unwrap().len() };
+            let pending = self.state.pending_count.load(Ordering::Acquire);
             if pending >= max {
                 return true;
             }
@@ -278,9 +285,9 @@ where
         if self.is_closing() {
             return false;
         }
-        // if self.reached_max_id() {
-        //     return false;
-        // }
+        if self.reached_max_id() {
+            return false;
+        }
         true
     }
     // same as will_be_reusable but checks max_in_flight
@@ -328,7 +335,7 @@ where
         true
     }
     pub fn is_idle(&self) -> bool {
-        self.pending.lock().unwrap().is_empty()
+        self.state.pending_count.load(Ordering::Acquire) == 0
     }
     pub fn last_read(&self) -> Instant {
         self.state.last_read.load(Ordering::Acquire)
@@ -344,7 +351,7 @@ where
         ConnectionStats {
             addr: self.addr,
             queries_sent: self.state.next_id.load(Ordering::Relaxed) as u64,
-            pending_responses: self.pending.lock().unwrap().len(),
+            pending_responses: self.state.pending_count.load(Ordering::Acquire),
             current_query_id: self.state.next_id.load(Ordering::Relaxed),
             age: now.duration_since(self.created_at),
             time_since_last_read: now.duration_since(self.last_read()),
@@ -358,7 +365,7 @@ where
         addr: SocketAddr,
         config: TcpConnectionConfig,
         read_fd: Option<RawFd>,
-    ) -> Result<Arc<Self>, TcpConnectionError> {
+    ) -> Result<Self, TcpConnectionError> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
 
         let mut conn = {
@@ -386,7 +393,7 @@ where
         conn.tasks
             .spawn(read_half(read, addr, conn.state.clone(), pending));
 
-        Ok(Arc::new(conn))
+        Ok(conn)
     }
 }
 
@@ -412,6 +419,7 @@ fn new_conn<R, W>(
             next_id: AtomicU16::new(0),
             is_closing: AtomicBool::new(false),
             last_read: AtomicInstant::new(now),
+            pending_count: AtomicUsize::new(0),
         }),
     }
 }
@@ -439,6 +447,7 @@ fn new_conn<R, W>(
             next_id: AtomicU16::new(0),
             is_closing: AtomicBool::new(false),
             last_read: AtomicInstant::new(now),
+            pending_count: AtomicUsize::new(0),
         }),
     }
 }
@@ -473,6 +482,7 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
                             sent_at: Instant::now(),
                         },
                     );
+                    state.pending_count.fetch_add(1, Ordering::Release);
                     drop(lock);
                 }
                 if let Err(err) = conn.flush().await {
@@ -512,6 +522,9 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                 let (r, is_empty) = {
                     let mut lock = pending.lock().unwrap();
                     let entry = lock.remove(&resp_id);
+                    if entry.is_some() {
+                        state.pending_count.fetch_sub(1, Ordering::Release);
+                    }
                     let is_empty = lock.is_empty();
                     (entry, is_empty)
                 };
@@ -538,8 +551,10 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                 }
             }
             Err(err) => {
-                warn!(%err, "tcp read half error");
-                state.is_closing.swap(true, Ordering::AcqRel);
+                // if the old state was not already closing, it's because we got read half error
+                if !state.is_closing.swap(true, Ordering::AcqRel) {
+                    warn!(%err, "tcp read half error");
+                }
                 break;
             }
         };
@@ -700,7 +715,7 @@ mod tests {
             max_in_flight: max_flight,
         };
         let conn = TcpConnection::from_split(read, write, addr, config, None).unwrap();
-        (conn, server, addr)
+        (Arc::new(conn), server, addr)
     }
     fn test_server(mut server: DuplexStream, addr: SocketAddr) -> tokio::task::JoinHandle<()> {
         // Test server task that mimics a DNS server
