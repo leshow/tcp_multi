@@ -191,11 +191,11 @@ where
                 return Err(SendError::Closed { query });
             }
             let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-            if next_id >= MAX_ID {
-                // exhausted IDs, return an error so a fresh connection is used
-                self.set_closing();
-                return Err(SendError::Closed { query });
-            }
+            // if next_id >= MAX_ID {
+            //     // exhausted IDs, return an error so a fresh connection is used
+            //     self.set_closing();
+            //     return Err(SendError::Closed { query });
+            // }
 
             let DnsQuery { mut to_send, reply } = query;
             let original_id = to_send.msg_id();
@@ -285,9 +285,9 @@ where
         if self.is_closing() {
             return false;
         }
-        if self.reached_max_id() {
-            return false;
-        }
+        // if self.reached_max_id() {
+        //     return false;
+        // }
         true
     }
     // same as will_be_reusable but checks max_in_flight
@@ -295,9 +295,9 @@ where
         if !self.will_be_reusable() {
             return false;
         }
-        if self.max_in_flight() {
-            return false;
-        }
+        // if self.max_in_flight() {
+        //     return false;
+        // }
 
         // true
         self.is_healthy()
@@ -385,8 +385,12 @@ where
                     queued_tx,
                 );
 
-                conn.tasks
-                    .spawn(send_half(send, queued_rx, pending.clone()));
+                conn.tasks.spawn(send_half(
+                    send,
+                    queued_rx,
+                    conn.state.clone(),
+                    pending.clone(),
+                ));
                 conn
             }
         };
@@ -456,6 +460,7 @@ fn new_conn<R, W>(
 async fn send_half<W: AsyncWriteExt + Unpin>(
     mut conn: W,
     mut queued_msgs: tokio::sync::mpsc::Receiver<PendingSend<SerialMsg>>,
+    state: Arc<State>,
     pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> std::io::Result<()> {
     while let Some(PendingSend {

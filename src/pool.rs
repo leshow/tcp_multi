@@ -1,16 +1,17 @@
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, OnceLock, RwLock, Weak},
+    ops::Deref,
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use tokio::{
-    sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::AbortHandle,
 };
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::{TcpConnection, TcpConnectionConfig};
 
@@ -42,6 +43,14 @@ pub struct ConnectionHandle {
     _permit: OwnedSemaphorePermit,
 }
 
+impl Deref for ConnectionHandle {
+    type Target = TcpConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
 /// Configuration for the connection pool
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
@@ -53,6 +62,7 @@ pub struct PoolConfig {
     pub max_idle_time: Duration,
     /// Interval between cleanup runs
     pub cleanup_interval: Duration,
+    pub stats_interval: Duration,
     /// TCP connection config-- maximum concurrent connections per downstream (None = unlimited)
     pub max_in_flight_per: Option<usize>,
     pub keepalive: KeepaliveConfig,
@@ -71,6 +81,7 @@ impl Default for PoolConfig {
             max_connections: 10,
             max_idle_time: Duration::from_secs(3),
             cleanup_interval: Duration::from_secs(30),
+            stats_interval: Duration::from_secs(2),
             max_in_flight_per: None,
             keepalive: KeepaliveConfig::default(),
         }
@@ -81,6 +92,7 @@ impl Drop for ConnectionHandle {
     fn drop(&mut self) {
         // Try to upgrade weak reference
         if let Some(pool) = self.pool.upgrade() {
+            trace!("notify connection on drop");
             pool.permit_available.notify_one();
         }
         // If pool is gone, nothing to notify
@@ -98,6 +110,8 @@ impl Drop for ConnectionPool {
 impl ConnectionPool {
     pub fn new(addr: SocketAddr, config: PoolConfig) -> Self {
         let cleanup_interval = config.cleanup_interval;
+        let stats_interval = config.stats_interval;
+
         let this = Self(Arc::new(PoolInner {
             connections: RwLock::new(VecDeque::new()),
             addr,
@@ -109,11 +123,24 @@ impl ConnectionPool {
         let abort_handle = tokio::spawn({
             let weak = Arc::downgrade(&this.0);
             async move {
+                let mut cleanup = tokio::time::interval(cleanup_interval);
+                let mut stats = tokio::time::interval(stats_interval);
+
+                cleanup.tick().await;
+                stats.tick().await;
+
                 loop {
-                    tokio::time::sleep(cleanup_interval).await;
-                    match weak.upgrade() {
-                        Some(pool) => pool.cleanup(),
-                        None => break, // Pool was dropped, exit
+                    let Some(inner) = weak.upgrade() else {
+                        break;
+                        // Pool was dropped, exit
+                    };
+                    tokio::select! {
+                        _ = cleanup.tick() => {
+                            inner.cleanup().await;
+                        }
+                        _ = stats.tick() => {
+                            inner.stats().await;
+                        }
                     }
                 }
             }
@@ -128,11 +155,17 @@ impl ConnectionPool {
     pub async fn try_get_connection(&self) -> Result<ConnectionHandle> {
         // Try to find connection with available permit (read lock)
         let len = {
-            let conns = self.0.connections.read().unwrap();
+            let conns = self.0.connections.read().await;
             let now = Instant::now();
             for pool_conn in conns.iter() {
                 // check if usable first?
-                if pool_conn.inner.conn.is_usable(now) {
+                let is_usable = pool_conn.inner.conn.is_usable(now);
+                // info!(
+                //     "try_get_connection: is_usable={}, available_permits={}",
+                //     is_usable,
+                //     pool_conn.inner.max_handles.available_permits()
+                // );
+                if is_usable {
                     // get a permit
                     if let Ok(permit) = pool_conn.inner.max_handles.clone().try_acquire_owned() {
                         return Ok(ConnectionHandle {
@@ -142,8 +175,9 @@ impl ConnectionPool {
                             pool: Arc::downgrade(&self.0),
                         });
                     }
+                } else {
+                    pool_conn.inner.conn.set_closing();
                 }
-                // @TODO else set_closing?
             }
             // All connections are at capacity
             conns.len()
@@ -151,31 +185,41 @@ impl ConnectionPool {
 
         // Try to create new connection if under limit (write lock)
         if len < self.0.config.max_connections {
-            // @TODO should I switch to async rwlock so this connection is created after write lock obtained?
+            let mut conns = self.0.connections.write().await;
+
             let new_conn = self.create_connection().await?;
-
-            let mut conns = self.0.connections.write().unwrap();
-
             // should never fail
-            let permit = new_conn.inner.max_handles.clone().try_acquire_owned()?;
+            let permit = new_conn
+                .inner
+                .max_handles
+                .clone()
+                .try_acquire_owned()
+                .expect("cant failed to acquire new semaphore");
             let handle = ConnectionHandle {
                 _permit: permit,
                 conn: new_conn.inner.conn.clone(),
                 // pool weak ref
                 pool: Arc::downgrade(&self.0),
             };
-            conns.push_back(new_conn);
+            conns.push_front(new_conn);
             return Ok(handle);
             // At max connections
         }
+        debug!(
+            "try_get_connection failed: len={}, max={}",
+            len, self.0.config.max_connections
+        );
         Err(anyhow::Error::msg("failed to get connection"))
     }
 
     pub async fn get_connection(&self) -> Result<ConnectionHandle> {
+        let mut count = 0;
         loop {
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(_) => {
+                    trace!(?count, "connections busy, waiting");
+                    count += 1;
                     // All connections busy and at capacity - wait for notification
                     self.0.permit_available.notified().await;
                     // Loop back and try again
@@ -203,33 +247,32 @@ impl ConnectionPool {
         })
     }
 
-    pub fn cleanup(&self) {
-        self.0.cleanup();
+    pub async fn cleanup(&self) {
+        self.0.cleanup().await;
     }
 }
 
 impl PoolInner {
-    fn cleanup(&self) {
+    async fn cleanup(&self) {
         let now = Instant::now();
 
         // Clean up idle connections
         {
-            let mut idle = self.connections.write().unwrap();
+            let mut conns = self.connections.write().await;
+            let original_count = conns.len();
 
-            let original_count = idle.len();
-
-            idle.retain(|conn| {
+            conns.retain(|conn| {
                 // Use sync method to get last activity
                 let last_activity = conn.inner.conn.last_read();
                 let age = now.duration_since(last_activity);
 
                 if age > self.config.max_idle_time {
-                    trace!("removing idle connection (age: {:?})", age);
+                    info!("removing idle connection (age: {:?})", age);
                     // to_shutdown.push(Arc::clone(conn));
                     conn.inner.conn.set_closing();
                     false
                 } else if !conn.inner.conn.will_be_reusable() {
-                    trace!("removing non-reusable connection");
+                    info!("removing non-reusable connection");
                     conn.inner.conn.set_closing();
                     false
                 } else {
@@ -237,10 +280,40 @@ impl PoolInner {
                 }
             });
 
-            let removed = original_count - idle.len();
+            let removed = original_count - conns.len();
             if removed > 0 {
                 debug!("removed {} idle connection(s)", removed);
             }
         }
+    }
+    async fn stats(&self) {
+        let now = Instant::now();
+        let conns = self.connections.read().await;
+        let original_count = conns.len();
+
+        // Collect stats before cleanup
+        let mut handles_in_use = 0;
+        let mut handles_available = 0;
+        let mut connection_ages = Vec::new();
+
+        for conn in conns.iter() {
+            let available_permits = conn.inner.max_handles.available_permits();
+            handles_in_use += (self.config.max_concurrent_per_conn - available_permits);
+            handles_available += available_permits;
+
+            let last_activity = conn.inner.conn.last_read();
+            let age = now.duration_since(last_activity);
+            connection_ages.push(age);
+        }
+
+        // Log pool stats
+        info!(
+            "Pool stats: connections={}, handles_in_use={}, available={}, max_connections={}, max_concurrent_per_conn={}",
+            original_count,
+            handles_in_use,
+            handles_available,
+            self.config.max_connections,
+            self.config.max_concurrent_per_conn
+        );
     }
 }

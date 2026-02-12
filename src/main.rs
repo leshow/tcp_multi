@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
@@ -130,13 +130,17 @@ async fn main() -> Result<()> {
         });
     }
 
-    // let pool = Arc::new(ConnectionPool::new(
-    //     addr,
-    //     PoolConfig {
-    //         max_idle_per: 10,
-    //         ..Default::default()
-    //     },
-    // ));
+    let pool = Arc::new(ConnectionPool::new(
+        addr,
+        PoolConfig {
+            max_concurrent_per_conn: 100,
+            max_connections: 10,
+            max_idle_time: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(30),
+            stats_interval: Duration::from_secs(2),
+            ..Default::default()
+        },
+    ));
     loop {
         let msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
@@ -158,34 +162,34 @@ async fn main() -> Result<()> {
 
         match mode {
             TransportMode::TcpConnection => {
-                if conn
-                    .as_ref()
-                    // !can_reuse()
-                    .is_none_or(|existing| !existing.is_usable(Instant::now()))
-                // .is_none_or(|existing| !existing.can_reuse())
-                {
-                    match TcpConnection::new(addr, config).await {
-                        Ok(new_conn) => {
-                            info!(?addr, "tcp connection established");
-                            conn = Some(Arc::new(new_conn));
-                        }
-                        Err(err) => {
-                            warn!(%err, "tcp connect failed");
-                            continue;
-                        }
-                    }
-                }
+                // if conn
+                //     .as_ref()
+                //     // !can_reuse()
+                //     .is_none_or(|existing| !existing.is_usable(Instant::now()))
+                // // .is_none_or(|existing| !existing.can_reuse())
+                // {
+                //     match TcpConnection::new(addr, config).await {
+                //         Ok(new_conn) => {
+                //             info!(?addr, "tcp connection established");
+                //             conn = Some(Arc::new(new_conn));
+                //         }
+                //         Err(err) => {
+                //             warn!(%err, "tcp connect failed");
+                //             continue;
+                //         }
+                //     }
+                // }
 
-                let Some(conn) = conn.clone() else {
-                    warn!("tcp connection missing after connect attempt");
-                    continue;
-                };
+                // let Some(conn) = conn.clone() else {
+                //     warn!("tcp connection missing after connect attempt");
+                //     continue;
+                // };
 
                 tokio::spawn({
                     let udp = udp.clone();
-                    // let pool = pool.clone();
+                    let pool = pool.clone();
                     async move {
-                        // let conn = pool.get_connection().await?;
+                        let conn = pool.get_connection().await?;
 
                         let (reply, rx) = tokio::sync::oneshot::channel();
                         match conn
@@ -207,6 +211,7 @@ async fn main() -> Result<()> {
                                 // if let Err(err) = conn.send(query).await {
                                 //     warn!(%err, "failed to send twice now, giving up");
                                 // }
+                                warn!("tried to send on closed connection");
                             }
                             Err(err) => {
                                 // unrecoverable kind of error
