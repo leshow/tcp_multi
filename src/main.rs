@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use tcp_multi::pool::{ConnectionPool, PoolConfig};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::{net::TcpStream, sync::Semaphore, time::interval};
 use tracing::{debug, info, level_filters::LevelFilter, trace, warn};
 use tracing_subscriber::{
@@ -21,6 +22,7 @@ const DEFAULT_LOG_FORMAT: &str = "pretty";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportMode {
+    Pool,
     TcpConnection,
     TcpStreamPerMessage,
 }
@@ -58,6 +60,7 @@ fn parse_args() -> Result<CliArgs> {
         ["-h"] | ["--help"] => bail!(usage()),
         [addr, max] | [addr, max, "--multi"] => (addr, max, TransportMode::TcpConnection),
         [addr, max, "--stream"] => (addr, max, TransportMode::TcpStreamPerMessage),
+        [addr, max, "--pool"] => (addr, max, TransportMode::Pool),
         _ => bail!(usage()),
     };
 
@@ -130,17 +133,18 @@ async fn main() -> Result<()> {
         });
     }
 
-    let pool = Arc::new(ConnectionPool::new(
+    let pool = ConnectionPool::new(
         addr,
         PoolConfig {
-            max_concurrent_per_conn: 100,
-            max_connections: 10,
+            max_concurrent_per_conn: 10,
+            max_connections: 1,
             max_idle_time: Duration::from_secs(5),
             cleanup_interval: Duration::from_secs(30),
             stats_interval: Duration::from_secs(2),
             ..Default::default()
         },
-    ));
+    );
+
     loop {
         let msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
@@ -161,78 +165,43 @@ async fn main() -> Result<()> {
         };
 
         match mode {
-            TransportMode::TcpConnection => {
-                // if conn
-                //     .as_ref()
-                //     // !can_reuse()
-                //     .is_none_or(|existing| !existing.is_usable(Instant::now()))
-                // // .is_none_or(|existing| !existing.can_reuse())
-                // {
-                //     match TcpConnection::new(addr, config).await {
-                //         Ok(new_conn) => {
-                //             info!(?addr, "tcp connection established");
-                //             conn = Some(Arc::new(new_conn));
-                //         }
-                //         Err(err) => {
-                //             warn!(%err, "tcp connect failed");
-                //             continue;
-                //         }
-                //     }
-                // }
-
-                // let Some(conn) = conn.clone() else {
-                //     warn!("tcp connection missing after connect attempt");
-                //     continue;
-                // };
-
+            TransportMode::Pool => {
                 tokio::spawn({
                     let udp = udp.clone();
                     let pool = pool.clone();
                     async move {
                         let conn = pool.get_connection().await?;
-
-                        let (reply, rx) = tokio::sync::oneshot::channel();
-                        match conn
-                            .send(DnsQuery {
-                                to_send: msg,
-                                reply,
-                            })
-                            .await
-                        {
-                            Ok(_) => {
-                                // succeeded
-                            }
-                            Err(SendError::Closed { query }) => {
-                                // channel closed, so send on another conn
-                                trace!("tried to send on closed channel, trying new connection");
-                                // pool.remove_connection(&conn);
-                                // drop(conn);
-                                // let conn = pool.get_connection().await?;
-                                // if let Err(err) = conn.send(query).await {
-                                //     warn!(%err, "failed to send twice now, giving up");
-                                // }
-                                warn!("tried to send on closed connection");
-                            }
-                            Err(err) => {
-                                // unrecoverable kind of error
-                                return Err(err.into());
-                            }
-                        }
-                        match rx.await {
-                            Ok(mut reply) => {
-                                // restore reply addr
-                                reply.set_addr(reply_addr);
-                                if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
-                                    warn!(%err, "udp reply failed");
-                                }
-                            }
-                            Err(err) => {
-                                warn!(%err, "oneshot tcp send failed");
-                            }
-                        };
-                        drop(permit);
-                        Ok::<_, anyhow::Error>(())
+                        send_query(&conn, udp, msg, reply_addr, permit).await
                     }
+                });
+            }
+            TransportMode::TcpConnection => {
+                if conn
+                    .as_ref()
+                    // !can_reuse()
+                    .is_none_or(|existing| !existing.is_usable(Instant::now()))
+                // .is_none_or(|existing| !existing.can_reuse())
+                {
+                    match TcpConnection::new(addr, config).await {
+                        Ok(new_conn) => {
+                            info!(?addr, "tcp connection established");
+                            conn = Some(Arc::new(new_conn));
+                        }
+                        Err(err) => {
+                            warn!(%err, "tcp connect failed");
+                            continue;
+                        }
+                    }
+                }
+
+                let Some(conn) = conn.clone() else {
+                    warn!("tcp connection missing after connect attempt");
+                    continue;
+                };
+
+                tokio::spawn({
+                    let udp = udp.clone();
+                    async move { send_query(&conn, udp, msg, reply_addr, permit).await }
                 });
             }
             TransportMode::TcpStreamPerMessage => {
@@ -298,4 +267,54 @@ pub fn init_tracing(vars: Option<EnvVars>) -> Result<()> {
     }
     info!(log_filter, log_fmt, "initialized tracing");
     Ok(())
+}
+
+async fn send_query(
+    conn: &TcpConnection,
+    udp: Arc<tokio::net::UdpSocket>,
+    msg: SerialMsg,
+    reply_addr: SocketAddr,
+    permit: OwnedSemaphorePermit,
+) -> Result<()> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+
+    match conn
+        .send(DnsQuery {
+            to_send: msg,
+            reply,
+        })
+        .await
+    {
+        Ok(_) => {
+            // succeeded
+        }
+        Err(SendError::Closed { query }) => {
+            // channel closed, so send on another conn
+            trace!("tried to send on closed channel, trying new connection");
+            // drop(conn);
+            // let conn = pool.get_connection().await?;
+            warn!(id =  ?query.to_send.msg_id(), "tried to send on closed connection");
+            // if let Err(err) = conn.send(query).await {
+            //     warn!(%err, "failed to send twice now, giving up");
+            // }
+        }
+        Err(err) => {
+            // unrecoverable kind of error
+            return Err(err.into());
+        }
+    }
+    match rx.await {
+        Ok(mut reply) => {
+            // restore reply addr
+            reply.set_addr(reply_addr);
+            if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
+                warn!(%err, "udp reply failed");
+            }
+        }
+        Err(err) => {
+            warn!(%err, "oneshot tcp send failed");
+        }
+    };
+    drop(permit);
+    Ok::<_, anyhow::Error>(())
 }

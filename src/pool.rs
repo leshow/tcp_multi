@@ -6,15 +6,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use thiserror::Error;
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::AbortHandle,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
-use crate::{TcpConnection, TcpConnectionConfig};
+use crate::{TcpConnection, TcpConnectionConfig, TcpConnectionError};
 
+#[derive(Debug, Error)]
+pub enum PoolError {
+    #[error("all connections at capacity")]
+    AllConnectionsBusy,
+    
+    #[error("failed to create connection: {0}")]
+    ConnectionCreation(#[from] TcpConnectionError),
+}
+
+#[derive(Clone)]
 pub struct ConnectionPool(Arc<PoolInner>);
 
 pub struct PoolInner {
@@ -152,20 +162,17 @@ impl ConnectionPool {
         this
     }
 
-    pub async fn try_get_connection(&self) -> Result<ConnectionHandle> {
+    pub async fn try_get_connection(&self) -> Result<ConnectionHandle, PoolError> {
         // Try to find connection with available permit (read lock)
-        let len = {
+        let (len, has_usable) = {
             let conns = self.0.connections.read().await;
             let now = Instant::now();
+            let mut has_usable = false;
             for pool_conn in conns.iter() {
                 // check if usable first?
                 let is_usable = pool_conn.inner.conn.is_usable(now);
-                // info!(
-                //     "try_get_connection: is_usable={}, available_permits={}",
-                //     is_usable,
-                //     pool_conn.inner.max_handles.available_permits()
-                // );
                 if is_usable {
+                    has_usable = true;
                     // get a permit
                     if let Ok(permit) = pool_conn.inner.max_handles.clone().try_acquire_owned() {
                         return Ok(ConnectionHandle {
@@ -180,55 +187,78 @@ impl ConnectionPool {
                 }
             }
             // All connections are at capacity
-            conns.len()
+            (conns.len(), has_usable)
         };
 
-        // Try to create new connection if under limit (write lock)
-        if len < self.0.config.max_connections {
+        // Try to create new connection if under limit OR if all existing connections are unusable
+        if len < self.0.config.max_connections || !has_usable {
             let mut conns = self.0.connections.write().await;
 
-            let new_conn = self.create_connection().await?;
-            // should never fail
-            let permit = new_conn
-                .inner
-                .max_handles
-                .clone()
-                .try_acquire_owned()
-                .expect("cant failed to acquire new semaphore");
-            let handle = ConnectionHandle {
-                _permit: permit,
-                conn: new_conn.inner.conn.clone(),
-                // pool weak ref
-                pool: Arc::downgrade(&self.0),
-            };
-            conns.push_front(new_conn);
-            return Ok(handle);
+            // Clean up any closing connections first
+            conns.retain(|conn| !conn.inner.conn.is_closing());
+            
+            match self.create_connection().await {
+                Ok(new_conn) => {
+                    let permit = new_conn
+                        .inner
+                        .max_handles
+                        .clone()
+                        .try_acquire_owned()
+                        .expect("cant failed to acquire new semaphore");
+                    let handle = ConnectionHandle {
+                        _permit: permit,
+                        conn: new_conn.inner.conn.clone(),
+                        // pool weak ref
+                        pool: Arc::downgrade(&self.0),
+                    };
+                    conns.push_front(new_conn);
+                    return Ok(handle);
+                }
+                Err(err) => {
+                    warn!(%err, "failed to create connection");
+                    return Err(err);
+                }
+            }
             // At max connections
         }
         debug!(
             "try_get_connection failed: len={}, max={}",
             len, self.0.config.max_connections
         );
-        Err(anyhow::Error::msg("failed to get connection"))
+        Err(PoolError::AllConnectionsBusy)
     }
 
-    pub async fn get_connection(&self) -> Result<ConnectionHandle> {
+    pub async fn get_connection(&self) -> Result<ConnectionHandle, PoolError> {
         let mut count = 0;
         loop {
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
-                Err(_) => {
-                    trace!(?count, "connections busy, waiting");
-                    count += 1;
-                    // All connections busy and at capacity - wait for notification
-                    self.0.permit_available.notified().await;
-                    // Loop back and try again
+                Err(err) => {
+                    // Check if this is a connection creation error or capacity error
+                    match err {
+                        PoolError::AllConnectionsBusy => {
+                            // Connections exist but are busy - wait for notification
+                            trace!(?count, "connections busy, waiting for available permit");
+                            count += 1;
+                            self.0.permit_available.notified().await;
+                        }
+                        PoolError::ConnectionCreation(ref tcp_err) => {
+                            // Connection creation failed - retry with backoff
+                            if count == 0 {
+                                warn!(%tcp_err, "failed to create connection, retrying");
+                            } else if count % 10 == 0 {
+                                warn!(%tcp_err, ?count, "connection creation still failing");
+                            }
+                            count += 1;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
     }
 
-    async fn create_connection(&self) -> Result<PoolConnection> {
+    async fn create_connection(&self) -> Result<PoolConnection, PoolError> {
         let conn = TcpConnection::new(
             self.0.addr,
             TcpConnectionConfig {

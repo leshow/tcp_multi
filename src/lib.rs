@@ -30,6 +30,7 @@ use crate::msg::SerialMsg;
 
 pub mod msg;
 pub mod pool;
+pub mod stream;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TcpConnectionConfig {
@@ -191,11 +192,11 @@ where
                 return Err(SendError::Closed { query });
             }
             let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-            // if next_id >= MAX_ID {
-            //     // exhausted IDs, return an error so a fresh connection is used
-            //     self.set_closing();
-            //     return Err(SendError::Closed { query });
-            // }
+            if next_id >= MAX_ID {
+                // exhausted IDs, return an error so a fresh connection is used
+                self.set_closing();
+                return Err(SendError::Closed { query });
+            }
 
             let DnsQuery { mut to_send, reply } = query;
             let original_id = to_send.msg_id();
@@ -285,9 +286,9 @@ where
         if self.is_closing() {
             return false;
         }
-        // if self.reached_max_id() {
-        //     return false;
-        // }
+        if self.reached_max_id() {
+            return false;
+        }
         true
     }
     // same as will_be_reusable but checks max_in_flight
@@ -295,9 +296,9 @@ where
         if !self.will_be_reusable() {
             return false;
         }
-        // if self.max_in_flight() {
-        //     return false;
-        // }
+        if self.max_in_flight() {
+            return false;
+        }
 
         // true
         self.is_healthy()
