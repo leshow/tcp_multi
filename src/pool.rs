@@ -260,32 +260,16 @@ impl ConnectionPool {
 
     pub async fn get_connection(&self) -> Result<ConnectionHandle, PoolError> {
         let mut count = 0;
-        // let future = self.0.permit_available.notified();
-        // tokio::pin!(future);
 
         loop {
-            // Make sure that no wakeup is lost if we get
-            // `None` from `try_recv`.
-            // future.as_mut().enable();
-
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
                     count += 1;
                     // warn!(count, ?err, "waiting for wakeup");
-                    // // Wait for a call to `notify_one`.
-                    // //
-                    // // This uses `.as_mut()` to avoid consuming the future,
-                    // // which lets us call `Pin::set` below.
-                    // future.as_mut().await;
-
-                    // // Reset the future in case another call to
-                    // // `try_recv` got the message before us.
-                    // future.set(self.0.permit_available.notified());
 
                     self.0.permit_available.notified().await;
                     // warn!("got wakeup, trying again");
-                    // // Check if this is a connection creation error or capacity error
                     // match err {
                     //     PoolError::AllConnectionsBusy => {
                     //         // Connections exist but are busy - wait for notification
