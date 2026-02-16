@@ -32,7 +32,7 @@ pub mod msg;
 pub mod pool;
 pub mod stream;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TcpConnectionConfig {
     /// keepalive idle
     pub ka_idle: Option<u64>,
@@ -42,7 +42,7 @@ pub struct TcpConnectionConfig {
     pub max_in_flight: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConnectionStats {
     pub addr: SocketAddr,
     pub queries_sent: u64,
@@ -186,7 +186,6 @@ where
         }
         #[cfg(feature = "locking")]
         {
-            let mut writer = self.writer.lock().await;
             // could have closed after lock
             if self.is_closing() {
                 return Err(SendError::Closed { query });
@@ -201,6 +200,8 @@ where
             let DnsQuery { mut to_send, reply } = query;
             let original_id = to_send.msg_id();
             to_send.replace_id(u16::to_be_bytes(next_id));
+
+            let mut writer = self.writer.lock().await;
             // insert entry
             {
                 let mut lock = self.pending.lock().unwrap();
@@ -222,12 +223,13 @@ where
                 return Err(SendError::Io(err));
             }
 
-            if let Err(err) = writer.flush().await {
-                warn!(%err, "TCP flush failed");
-                self.set_closing();
-                self.remove_pending(next_id);
-                return Err(SendError::Io(err));
-            }
+            // if let Err(err) = writer.flush().await {
+            //     warn!(%err, "TCP flush failed");
+            //     self.set_closing();
+            //     self.remove_pending(next_id);
+            //     return Err(SendError::Io(err));
+            // }
+            drop(writer);
         }
 
         #[cfg(not(feature = "locking"))]

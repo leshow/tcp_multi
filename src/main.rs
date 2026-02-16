@@ -95,22 +95,15 @@ async fn send_over_new_stream(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(None)?;
-    #[cfg(feature = "locking")]
-    info!("started with locking");
-
-    #[cfg(not(feature = "locking"))]
-    info!("started with write task");
-
     let cli = parse_args()?;
     let addr = cli.addr;
     let total_in_flight = cli.max_in_flight;
     let mode = cli.mode;
+    #[cfg(feature = "locking")]
+    info!(?mode, "started with locking");
 
-    let config = TcpConnectionConfig {
-        ka_idle: Some(1),
-        ka_interval: Some(1),
-        max_in_flight: None,
-    };
+    #[cfg(not(feature = "locking"))]
+    info!(?mode, "started with write task");
 
     let udp = Arc::new(tokio::net::UdpSocket::bind("[::]:9953").await?);
     info!(?addr, "udp socket bound");
@@ -144,6 +137,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         },
     );
+    let config = TcpConnectionConfig::default();
 
     loop {
         let msg = match SerialMsg::recv(&udp).await {
@@ -290,7 +284,7 @@ async fn send_query(
         }
         Err(SendError::Closed { query }) => {
             // channel closed, so send on another conn
-            trace!("tried to send on closed channel, trying new connection");
+            trace!("tried to send on closed channel");
             // drop(conn);
             // let conn = pool.get_connection().await?;
             warn!(id =  ?query.to_send.msg_id(), "tried to send on closed connection");

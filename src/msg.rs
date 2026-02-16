@@ -4,13 +4,14 @@ use hickory_proto::{
     serialize::binary::{BinDecodable, BinDecoder},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
 
 use std::{
     borrow::Borrow,
     io::{self, ErrorKind, IoSlice},
+    mem::MaybeUninit,
     net::SocketAddr,
 };
 
@@ -189,8 +190,9 @@ impl SerialMsg {
     where
         S: Borrow<UdpSocket>,
     {
-        let mut buf = [0u8; crate::msg::BUF_SIZE];
-        let (len, src) = stream.borrow().recv_from(&mut buf).await?;
-        Ok(SerialMsg::new(buf[..len].to_vec(), src))
+        let mut uninit = [MaybeUninit::<u8>::uninit(); crate::msg::BUF_SIZE];
+        let mut buf = ReadBuf::uninit(&mut uninit);
+        let (_len, src) = stream.borrow().recv_buf_from(&mut buf).await?;
+        Ok(SerialMsg::new(buf.filled().to_vec(), src))
     }
 }

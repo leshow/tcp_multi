@@ -11,7 +11,7 @@ use tokio::{
     sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::AbortHandle,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{TcpConnection, TcpConnectionConfig, TcpConnectionError};
 
@@ -19,7 +19,7 @@ use crate::{TcpConnection, TcpConnectionConfig, TcpConnectionError};
 pub enum PoolError {
     #[error("all connections at capacity")]
     AllConnectionsBusy,
-    
+
     #[error("failed to create connection: {0}")]
     ConnectionCreation(#[from] TcpConnectionError),
 }
@@ -140,19 +140,28 @@ impl ConnectionPool {
                 stats.tick().await;
 
                 loop {
+                    trace!("background task loop start");
                     let Some(inner) = weak.upgrade() else {
+                        error!("pool inner dropped, cleanup task exiting");
                         break;
-                        // Pool was dropped, exit
                     };
+                    trace!("weak upgrade succeeded, about to select");
+
                     tokio::select! {
                         _ = cleanup.tick() => {
+                            trace!("cleanup tick fired");
                             inner.cleanup().await;
+                            trace!("cleanup completed");
                         }
                         _ = stats.tick() => {
+                            trace!("stats tick fired");
                             inner.stats().await;
+                            trace!("stats completed");
                         }
                     }
+                    trace!("select completed, looping back");
                 }
+                error!("background task exited loop - THIS SHOULD NOT HAPPEN");
             }
         })
         .abort_handle();
@@ -196,7 +205,7 @@ impl ConnectionPool {
 
             // Clean up any closing connections first
             conns.retain(|conn| !conn.inner.conn.is_closing());
-            
+
             match self.create_connection().await {
                 Ok(new_conn) => {
                     let permit = new_conn
@@ -234,25 +243,26 @@ impl ConnectionPool {
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
-                    // Check if this is a connection creation error or capacity error
-                    match err {
-                        PoolError::AllConnectionsBusy => {
-                            // Connections exist but are busy - wait for notification
-                            trace!(?count, "connections busy, waiting for available permit");
-                            count += 1;
-                            self.0.permit_available.notified().await;
-                        }
-                        PoolError::ConnectionCreation(ref tcp_err) => {
-                            // Connection creation failed - retry with backoff
-                            if count == 0 {
-                                warn!(%tcp_err, "failed to create connection, retrying");
-                            } else if count % 10 == 0 {
-                                warn!(%tcp_err, ?count, "connection creation still failing");
-                            }
-                            count += 1;
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
+                    self.0.permit_available.notified().await;
+                    // // Check if this is a connection creation error or capacity error
+                    // match err {
+                    //     PoolError::AllConnectionsBusy => {
+                    //         // Connections exist but are busy - wait for notification
+                    //         trace!(?count, "connections busy, waiting for available permit");
+                    //         count += 1;
+                    //         self.0.permit_available.notified().await;
+                    //     }
+                    //     PoolError::ConnectionCreation(ref tcp_err) => {
+                    //         // Connection creation failed - retry with backoff
+                    //         if count == 0 {
+                    //             warn!(%tcp_err, "failed to create connection, retrying");
+                    //         } else if count % 10 == 0 {
+                    //             warn!(%tcp_err, ?count, "connection creation still failing");
+                    //         }
+                    //         count += 1;
+                    //         tokio::time::sleep(Duration::from_millis(100)).await;
+                    //     }
+                    // }
                 }
             }
         }
@@ -284,11 +294,14 @@ impl ConnectionPool {
 
 impl PoolInner {
     async fn cleanup(&self) {
+        trace!("cleanup: starting");
         let now = Instant::now();
 
         // Clean up idle connections
         {
+            trace!("cleanup: acquiring write lock");
             let mut conns = self.connections.write().await;
+            trace!("cleanup: write lock acquired");
             let original_count = conns.len();
 
             conns.retain(|conn| {
@@ -314,12 +327,17 @@ impl PoolInner {
             if removed > 0 {
                 debug!("removed {} idle connection(s)", removed);
             }
+            trace!("cleanup: releasing write lock");
         }
+        trace!("cleanup: done");
     }
     async fn stats(&self) {
-        let now = Instant::now();
+        trace!("stats: acquiring read lock");
         let conns = self.connections.read().await;
+        trace!("stats: read lock acquired");
         let original_count = conns.len();
+
+        let now = Instant::now();
 
         // Collect stats before cleanup
         let mut handles_in_use = 0;
@@ -345,5 +363,6 @@ impl PoolInner {
             self.config.max_connections,
             self.config.max_concurrent_per_conn
         );
+        trace!("stats: done");
     }
 }
