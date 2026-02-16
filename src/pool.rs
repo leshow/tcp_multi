@@ -72,7 +72,8 @@ pub struct PoolConfig {
     pub max_idle_time: Duration,
     /// Interval between cleanup runs
     pub cleanup_interval: Duration,
-    pub stats_interval: Duration,
+    /// Interval for logging stats (None = disabled)
+    pub stats_interval: Option<Duration>,
     /// TCP connection config-- maximum concurrent connections per downstream (None = unlimited)
     pub max_in_flight_per: Option<usize>,
     pub keepalive: KeepaliveConfig,
@@ -91,7 +92,7 @@ impl Default for PoolConfig {
             max_connections: 10,
             max_idle_time: Duration::from_secs(3),
             cleanup_interval: Duration::from_secs(30),
-            stats_interval: Duration::from_secs(2),
+            stats_interval: Some(Duration::from_secs(2)),
             max_in_flight_per: None,
             keepalive: KeepaliveConfig::default(),
         }
@@ -111,8 +112,17 @@ impl Drop for ConnectionHandle {
 
 impl Drop for ConnectionPool {
     fn drop(&mut self) {
-        if let Some(handle) = &self.0._cleanup.get() {
-            handle.abort();
+        // Only abort the cleanup task if this is the last ConnectionPool reference
+        if Arc::strong_count(&self.0) == 1 {
+            trace!("last ConnectionPool dropped, aborting background task");
+            if let Some(handle) = self.0._cleanup.get() {
+                handle.abort();
+            }
+        } else {
+            trace!(
+                "ConnectionPool clone dropped, {} references remain",
+                Arc::strong_count(&self.0) - 1
+            );
         }
     }
 }
@@ -134,34 +144,37 @@ impl ConnectionPool {
             let weak = Arc::downgrade(&this.0);
             async move {
                 let mut cleanup = tokio::time::interval(cleanup_interval);
-                let mut stats = tokio::time::interval(stats_interval);
+
+                let mut stats = stats_interval.map(tokio::time::interval);
 
                 cleanup.tick().await;
-                stats.tick().await;
+                if let Some(s) = &mut stats {
+                    s.tick().await;
+                }
 
                 loop {
-                    trace!("background task loop start");
                     let Some(inner) = weak.upgrade() else {
                         error!("pool inner dropped, cleanup task exiting");
                         break;
                     };
-                    trace!("weak upgrade succeeded, about to select");
-
-                    tokio::select! {
-                        _ = cleanup.tick() => {
-                            trace!("cleanup tick fired");
-                            inner.cleanup().await;
-                            trace!("cleanup completed");
+                    match &mut stats {
+                        Some(s) => {
+                            tokio::select! {
+                                _ = cleanup.tick() => {
+                                    inner.cleanup().await;
+                                }
+                                _ = s.tick() => {
+                                    inner.stats().await;
+                                }
+                            }
                         }
-                        _ = stats.tick() => {
-                            trace!("stats tick fired");
-                            inner.stats().await;
-                            trace!("stats completed");
+                        None => {
+                            cleanup.tick().await;
+                            inner.cleanup().await;
                         }
                     }
-                    trace!("select completed, looping back");
                 }
-                error!("background task exited loop - THIS SHOULD NOT HAPPEN");
+                error!("background task exited loop");
             }
         })
         .abort_handle();
@@ -243,6 +256,8 @@ impl ConnectionPool {
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
+                    count += 1;
+                    warn!(count, ?err, "waiting for wakeup");
                     self.0.permit_available.notified().await;
                     // // Check if this is a connection creation error or capacity error
                     // match err {
@@ -294,14 +309,11 @@ impl ConnectionPool {
 
 impl PoolInner {
     async fn cleanup(&self) {
-        trace!("cleanup: starting");
         let now = Instant::now();
 
         // Clean up idle connections
         {
-            trace!("cleanup: acquiring write lock");
             let mut conns = self.connections.write().await;
-            trace!("cleanup: write lock acquired");
             let original_count = conns.len();
 
             conns.retain(|conn| {
@@ -327,14 +339,11 @@ impl PoolInner {
             if removed > 0 {
                 debug!("removed {} idle connection(s)", removed);
             }
-            trace!("cleanup: releasing write lock");
         }
         trace!("cleanup: done");
     }
     async fn stats(&self) {
-        trace!("stats: acquiring read lock");
         let conns = self.connections.read().await;
-        trace!("stats: read lock acquired");
         let original_count = conns.len();
 
         let now = Instant::now();
@@ -353,7 +362,6 @@ impl PoolInner {
             let age = now.duration_since(last_activity);
             connection_ages.push(age);
         }
-
         // Log pool stats
         info!(
             "Pool stats: connections={}, handles_in_use={}, available={}, max_connections={}, max_concurrent_per_conn={}",
@@ -363,6 +371,5 @@ impl PoolInner {
             self.config.max_connections,
             self.config.max_concurrent_per_conn
         );
-        trace!("stats: done");
     }
 }

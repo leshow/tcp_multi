@@ -129,11 +129,11 @@ async fn main() -> Result<()> {
     let pool = ConnectionPool::new(
         addr,
         PoolConfig {
-            max_concurrent_per_conn: 10,
-            max_connections: 1,
+            max_concurrent_per_conn: 50,
+            max_connections: 10,
             max_idle_time: Duration::from_secs(5),
             cleanup_interval: Duration::from_secs(30),
-            stats_interval: Duration::from_secs(2),
+            stats_interval: Some(Duration::from_secs(2)),
             ..Default::default()
         },
     );
