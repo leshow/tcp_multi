@@ -84,7 +84,7 @@ async fn send_over_new_stream(
 ) -> Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     let _ = stream.set_nodelay(true);
-    msg.write(&mut stream).await?;
+    msg.writev(&mut stream).await?;
 
     let mut reply = SerialMsg::read(&mut stream, addr).await?;
     reply.set_addr(reply_addr);
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let pool = ConnectionPool::new(
         addr,
         PoolConfig {
-            max_concurrent_per_conn: 50,
+            max_concurrent_per_conn: 20,
             max_connections: 10,
             max_idle_time: Duration::from_secs(5),
             cleanup_interval: Duration::from_secs(30),

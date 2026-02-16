@@ -186,22 +186,24 @@ where
         }
         #[cfg(feature = "locking")]
         {
-            // could have closed after lock
-            if self.is_closing() {
-                return Err(SendError::Closed { query });
-            }
             let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-            if next_id >= MAX_ID {
-                // exhausted IDs, return an error so a fresh connection is used
-                self.set_closing();
-                return Err(SendError::Closed { query });
-            }
+            // lets not force the caller to resend on increment
+            // if next_id >= MAX_ID {
+            //     // exhausted IDs, return an error so a fresh connection is used
+            //     self.set_closing();
+            //     return Err(SendError::Closed { query });
+            // }
+
+            let mut writer = self.writer.lock().await;
+            // // could have closed after lock
+            // if self.is_closing() {
+            //     return Err(SendError::Closed { query });
+            // }
 
             let DnsQuery { mut to_send, reply } = query;
             let original_id = to_send.msg_id();
             to_send.replace_id(u16::to_be_bytes(next_id));
 
-            let mut writer = self.writer.lock().await;
             // insert entry
             {
                 let mut lock = self.pending.lock().unwrap();
@@ -235,11 +237,11 @@ where
         #[cfg(not(feature = "locking"))]
         {
             let next_id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-            if next_id >= MAX_ID {
-                // exhausted IDs, return an error so a fresh connection is used
-                self.set_closing();
-                return Err(SendError::Closed { query });
-            }
+            // if next_id >= MAX_ID {
+            //     // exhausted IDs, return an error so a fresh connection is used
+            //     self.set_closing();
+            //     return Err(SendError::Closed { query });
+            // }
 
             let DnsQuery { mut to_send, reply } = query;
             if let Err(err) = self
@@ -253,6 +255,10 @@ where
             {
                 warn!(%err, "TCP pending queue dropped, setting connection to closing");
                 self.set_closing();
+                return Err(SendError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed",
+                )));
             }
         }
         Ok(())
@@ -265,9 +271,6 @@ where
             drop(resp.reply);
         }
     }
-    // pub fn set_closing(&self) {
-    //     self.state.is_closing.swap(true, Ordering::AcqRel);
-    // }
     pub fn set_closing(&self) {
         let old = self.state.is_closing.swap(true, Ordering::AcqRel);
         debug!(old_closing = old, "set_closing called"); // Add this debug

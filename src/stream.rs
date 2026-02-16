@@ -1,11 +1,10 @@
-use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::RwLock;
-use tokio::time::timeout;
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::{io::AsyncReadExt, net::TcpStream, sync::RwLock, time::timeout};
 use uuid::Uuid;
 
 use crate::msg::SerialMsg;

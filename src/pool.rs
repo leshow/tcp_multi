@@ -186,15 +186,14 @@ impl ConnectionPool {
 
     pub async fn try_get_connection(&self) -> Result<ConnectionHandle, PoolError> {
         // Try to find connection with available permit (read lock)
-        let (len, has_usable) = {
+        let (len, cleanup) = {
             let conns = self.0.connections.read().await;
             let now = Instant::now();
-            let mut has_usable = false;
+            let mut needs_cleanup = false;
+
             for pool_conn in conns.iter() {
                 // check if usable first?
-                let is_usable = pool_conn.inner.conn.is_usable(now);
-                if is_usable {
-                    has_usable = true;
+                if pool_conn.inner.conn.is_usable(now) {
                     // get a permit
                     if let Ok(permit) = pool_conn.inner.max_handles.clone().try_acquire_owned() {
                         return Ok(ConnectionHandle {
@@ -205,19 +204,29 @@ impl ConnectionPool {
                         });
                     }
                 } else {
+                    needs_cleanup = true;
                     pool_conn.inner.conn.set_closing();
                 }
             }
             // All connections are at capacity
-            (conns.len(), has_usable)
+            (conns.len(), needs_cleanup)
         };
 
         // Try to create new connection if under limit OR if all existing connections are unusable
-        if len < self.0.config.max_connections || !has_usable {
+        if len < self.0.config.max_connections || cleanup {
             let mut conns = self.0.connections.write().await;
 
-            // Clean up any closing connections first
-            conns.retain(|conn| !conn.inner.conn.is_closing());
+            if cleanup {
+                info!("running cleanup");
+                // Clean up any closing connections first
+                conns.retain(|conn| !conn.inner.conn.is_closing());
+            }
+
+            // Re-check after acquiring write lock and cleanup to prevent race condition
+            if conns.len() >= self.0.config.max_connections {
+                debug!("already at max connections after acquiring write lock");
+                return Err(PoolError::AllConnectionsBusy);
+            }
 
             match self.create_connection().await {
                 Ok(new_conn) => {
@@ -226,7 +235,7 @@ impl ConnectionPool {
                         .max_handles
                         .clone()
                         .try_acquire_owned()
-                        .expect("cant failed to acquire new semaphore");
+                        .expect("cant fail to acquire new semaphore");
                     let handle = ConnectionHandle {
                         _permit: permit,
                         conn: new_conn.inner.conn.clone(),
@@ -241,7 +250,6 @@ impl ConnectionPool {
                     return Err(err);
                 }
             }
-            // At max connections
         }
         debug!(
             "try_get_connection failed: len={}, max={}",
@@ -252,13 +260,31 @@ impl ConnectionPool {
 
     pub async fn get_connection(&self) -> Result<ConnectionHandle, PoolError> {
         let mut count = 0;
+        // let future = self.0.permit_available.notified();
+        // tokio::pin!(future);
+
         loop {
+            // Make sure that no wakeup is lost if we get
+            // `None` from `try_recv`.
+            // future.as_mut().enable();
+
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
                     count += 1;
-                    warn!(count, ?err, "waiting for wakeup");
+                    // warn!(count, ?err, "waiting for wakeup");
+                    // // Wait for a call to `notify_one`.
+                    // //
+                    // // This uses `.as_mut()` to avoid consuming the future,
+                    // // which lets us call `Pin::set` below.
+                    // future.as_mut().await;
+
+                    // // Reset the future in case another call to
+                    // // `try_recv` got the message before us.
+                    // future.set(self.0.permit_available.notified());
+
                     self.0.permit_available.notified().await;
+                    // warn!("got wakeup, trying again");
                     // // Check if this is a connection creation error or capacity error
                     // match err {
                     //     PoolError::AllConnectionsBusy => {
@@ -355,7 +381,7 @@ impl PoolInner {
 
         for conn in conns.iter() {
             let available_permits = conn.inner.max_handles.available_permits();
-            handles_in_use += (self.config.max_concurrent_per_conn - available_permits);
+            handles_in_use += self.config.max_concurrent_per_conn - available_permits;
             handles_available += available_permits;
 
             let last_activity = conn.inner.conn.last_read();
