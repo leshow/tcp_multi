@@ -158,9 +158,11 @@ impl TcpConnection<OwnedReadHalf, OwnedWriteHalf> {
         addr: SocketAddr,
         config: TcpConnectionConfig,
     ) -> Result<Self, TcpConnectionError> {
+        debug!(%addr, ?config, "creating new tcp connection",);
         let (read, send) = tcpstream_connect(addr, config.ka_idle, config.ka_interval)
             .await?
             .into_split();
+        trace!(%addr, "tcp connection created");
         let read_fd = read.as_ref().as_raw_fd();
         Self::from_split(read, send, addr, config, Some(read_fd))
     }

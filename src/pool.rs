@@ -96,7 +96,7 @@ pub struct KeepaliveConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_concurrent: 1000,
+            max_concurrent: 100,
             max_connections: 10,
             max_idle_time: Duration::from_secs(3),
             cleanup_interval: Duration::from_secs(30),
@@ -109,7 +109,8 @@ impl Default for PoolConfig {
 
 impl Drop for ConnectionHandle {
     fn drop(&mut self) {
-        // Try to upgrade weak reference
+        // the weak reference is not currently used for anything
+        // could be used to skip the OwnedPermit and some clones
         if let Some(_pool) = self.pool.upgrade() {
             trace!("notify connection on drop");
             // pool.max_concurrent.add_permits(1);
@@ -228,7 +229,7 @@ impl ConnectionPool {
         // If under max_connections, try to create a new connection immediately
         if should_grow {
             let mut conns = self.0.connections.write().await;
-            
+
             // Double-check after acquiring write lock
             if conns.len() < self.0.config.max_connections {
                 match self.create_connection().await {
@@ -256,44 +257,39 @@ impl ConnectionPool {
             let now = Instant::now();
             let mut needs_cleanup = false;
 
-            if conns.is_empty() {
-                // Pool is empty - need to create first connection
-                (0, false)
-            } else {
-                // Round-robin selection among usable connections
-                let start = self.0.round_robin.fetch_add(1, Ordering::Relaxed) % conns.len();
+            // Round-robin selection among usable connections
+            let start = self.0.round_robin.fetch_add(1, Ordering::Relaxed) % conns.len();
 
-                // Try from start to end
-                for i in start..conns.len() {
-                    if conns[i].inner.conn.is_usable(now) {
-                        return Ok(ConnectionHandle {
-                            _permit: permit,
-                            conn: conns[i].inner.conn.clone(),
-                            pool: Arc::downgrade(&self.0),
-                        });
-                    } else {
-                        needs_cleanup = true;
-                        conns[i].inner.conn.set_closing();
-                    }
+            // Try from start to end
+            for i in start..conns.len() {
+                if conns[i].inner.conn.is_usable(now) {
+                    return Ok(ConnectionHandle {
+                        _permit: permit,
+                        conn: conns[i].inner.conn.clone(),
+                        pool: Arc::downgrade(&self.0),
+                    });
+                } else {
+                    needs_cleanup = true;
+                    conns[i].inner.conn.set_closing();
                 }
-
-                // Try from beginning to start
-                for i in 0..start {
-                    if conns[i].inner.conn.is_usable(now) {
-                        return Ok(ConnectionHandle {
-                            _permit: permit,
-                            conn: conns[i].inner.conn.clone(),
-                            pool: Arc::downgrade(&self.0),
-                        });
-                    } else {
-                        needs_cleanup = true;
-                        conns[i].inner.conn.set_closing();
-                    }
-                }
-
-                // No usable connections found
-                (conns.len(), needs_cleanup)
             }
+
+            // Try from beginning to start
+            for i in 0..start {
+                if conns[i].inner.conn.is_usable(now) {
+                    return Ok(ConnectionHandle {
+                        _permit: permit,
+                        conn: conns[i].inner.conn.clone(),
+                        pool: Arc::downgrade(&self.0),
+                    });
+                } else {
+                    needs_cleanup = true;
+                    conns[i].inner.conn.set_closing();
+                }
+            }
+
+            // No usable connections found
+            (conns.len(), needs_cleanup)
         };
 
         // Try to create new connection if under limit OR if all existing connections are unusable
@@ -330,8 +326,9 @@ impl ConnectionPool {
             }
         }
         debug!(
-            "try_get_connection failed: len={}, max={}",
-            len, self.0.config.max_connections
+            len,
+            max = self.0.config.max_connections,
+            "_get_connection failed",
         );
 
         Err(PoolError::AllConnectionsBusy)
