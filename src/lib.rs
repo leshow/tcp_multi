@@ -28,6 +28,7 @@ use tracing::{debug, trace, warn};
 
 use crate::msg::SerialMsg;
 
+pub mod dpool;
 pub mod msg;
 pub mod pool;
 pub mod stream;

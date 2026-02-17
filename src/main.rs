@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use tcp_multi::dpool;
 use tcp_multi::pool::{ConnectionPool, PoolConfig};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::{net::TcpStream, sync::Semaphore, time::interval};
@@ -23,6 +24,7 @@ const DEFAULT_LOG_FORMAT: &str = "pretty";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportMode {
     Pool,
+    Deadpool,
     TcpConnection,
     TcpStreamPerMessage,
 }
@@ -50,7 +52,7 @@ impl Default for EnvVars {
 }
 
 fn usage() -> &'static str {
-    "usage: tcp_multi <tcp_addr:port> <max_in_flight> [--stream|--multi]"
+    "usage: tcp_multi <tcp_addr:port> <max_in_flight> [--stream|--multi|--pool|--deadpool]"
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -61,6 +63,7 @@ fn parse_args() -> Result<CliArgs> {
         [addr, max] | [addr, max, "--multi"] => (addr, max, TransportMode::TcpConnection),
         [addr, max, "--stream"] => (addr, max, TransportMode::TcpStreamPerMessage),
         [addr, max, "--pool"] => (addr, max, TransportMode::Pool),
+        [addr, max, "--deadpool"] => (addr, max, TransportMode::Deadpool),
         _ => bail!(usage()),
     };
 
@@ -139,6 +142,8 @@ async fn main() -> Result<()> {
     );
     let config = TcpConnectionConfig::default();
 
+    let deadpool = dpool::create_pool(addr, config, 10);
+
     loop {
         let msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
@@ -166,6 +171,22 @@ async fn main() -> Result<()> {
                     async move {
                         let conn = pool.get_connection().await?;
                         send_query(&conn, udp, msg, reply_addr, permit).await
+                    }
+                });
+            }
+            TransportMode::Deadpool => {
+                tokio::spawn({
+                    let udp = udp.clone();
+                    let deadpool = deadpool.clone();
+                    async move {
+                        match deadpool.get().await {
+                            Ok(conn) => send_query(&conn, udp, msg, reply_addr, permit).await,
+                            Err(err) => {
+                                warn!(%err, "failed to get deadpool connection");
+                                drop(permit);
+                                Ok(())
+                            }
+                        }
                     }
                 });
             }
