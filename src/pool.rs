@@ -219,6 +219,37 @@ impl ConnectionPool {
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<ConnectionHandle, PoolError> {
+        // Check if we should grow the pool first (read lock to check size)
+        let should_grow = {
+            let conns = self.0.connections.read().await;
+            conns.len() < self.0.config.max_connections
+        };
+
+        // If under max_connections, try to create a new connection immediately
+        if should_grow {
+            let mut conns = self.0.connections.write().await;
+            
+            // Double-check after acquiring write lock
+            if conns.len() < self.0.config.max_connections {
+                match self.create_connection().await {
+                    Ok(new_conn) => {
+                        let handle = ConnectionHandle {
+                            _permit: permit,
+                            conn: new_conn.inner.conn.clone(),
+                            pool: Arc::downgrade(&self.0),
+                        };
+                        conns.push_front(new_conn);
+                        return Ok(handle);
+                    }
+                    Err(err) => {
+                        warn!(%err, "failed to create connection, falling back to existing");
+                        // Fall through to try existing connections
+                    }
+                }
+            }
+            // If creation failed or someone else created one, fall through to round-robin
+        }
+
         // Get connection using round-robin (read lock only)
         let (len, cleanup) = {
             let conns = self.0.connections.read().await;
