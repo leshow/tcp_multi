@@ -266,10 +266,9 @@ impl ConnectionPool {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
                     count += 1;
-                    // warn!(count, ?err, "waiting for wakeup");
-
+                    trace!(count, ?err, "waiting for wakeup");
                     self.0.permit_available.notified().await;
-                    // warn!("got wakeup, trying again");
+                    trace!("got wakeup, trying again");
                     // match err {
                     //     PoolError::AllConnectionsBusy => {
                     //         // Connections exist but are busy - wait for notification

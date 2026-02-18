@@ -15,8 +15,11 @@ use std::{
 use atomic_time::AtomicInstant;
 use socket2::TcpKeepalive;
 use thiserror::Error;
+#[cfg(feature = "locking")]
+use tokio::io::{AsyncReadExt, AsyncWrite};
+#[cfg(not(feature = "locking"))]
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         TcpSocket, TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},

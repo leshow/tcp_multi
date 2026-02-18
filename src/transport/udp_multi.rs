@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     ops::Index,
 };
 
@@ -10,7 +10,7 @@ use tokio::{
     self,
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task::JoinHandle,
+    task::JoinSet,
 };
 use tracing::*;
 
@@ -35,11 +35,40 @@ impl<T> ChanMsg<T> {
 
 pub type ChanMap<T> = HashMap<u16, T>;
 
-pub struct UdpConnection {
-    addr: SocketAddr
+#[derive(Debug)]
+pub struct UdpMulti {
+    num: usize,
+    tx: mpsc::Sender<ChanMsg<SerialMsg>>,
+    tasks: JoinSet<anyhow::Result<()>>,
 }
-// TODO: start one udp_multi task per namespace instance so we have
-// not just one channel handling all the messages
+
+impl Drop for UdpMulti {
+    fn drop(&mut self) {
+        trace!(num = self.num, "UdpMulti drop called");
+        self.tasks.abort_all();
+    }
+}
+
+impl UdpMulti {
+    pub fn new(num: usize, chan_size: usize) -> Self {
+        let (tx, rx) = mpsc::channel(chan_size);
+        let mut this = Self {
+            num,
+            tx,
+            tasks: JoinSet::new(),
+        };
+        this.tasks.spawn(udp_multi(num, rx));
+        this
+    }
+
+    pub async fn send(
+        &self,
+        msg: ChanMsg<SerialMsg>,
+    ) -> Result<(), mpsc::error::SendError<ChanMsg<SerialMsg>>> {
+        self.tx.send(msg).await
+    }
+}
+
 pub async fn udp_multi(
     num: usize,
     mut chan_msg_rx: mpsc::Receiver<ChanMsg<SerialMsg>>,
@@ -58,7 +87,7 @@ pub async fn udp_multi(
                     let id = msg.msg_id();
                     if let Some((send, query, orig_id)) = map.remove(&id) {
                         let Ok(response_query) = msg.query() else {
-                            warn!(?id, "Received response but query did not parse.");
+                            warn!(?id, ?num, "Received response but query did not parse.");
                             continue;
                         };
 
@@ -66,6 +95,7 @@ pub async fn udp_multi(
                         if !response_query.eq(&query) {
                             warn!(
                                 ?id,
+                                ?num,
                                 name = ?query.name(),
                                 response_name = ?response_query.name(),
                                 "Received response but query did not match."
@@ -104,31 +134,13 @@ pub async fn udp_multi(
     }
 }
 
-pub fn task(num: usize, udp_rx: mpsc::Receiver<ChanMsg<SerialMsg>>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = udp_multi(num, udp_rx).await {
-            error!(?err, "Starting udp receiver failed");
-        }
-    })
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct UdpTask;
-
-impl UdpTask {
-    pub fn make(num: usize, udp_rx: mpsc::Receiver<ChanMsg<SerialMsg>>) -> JoinHandle<()> {
-        task(num, udp_rx)
-    }
-}
-
 #[derive(Debug)]
 pub struct UdpTasks {
-    senders: Vec<mpsc::Sender<ChanMsg<SerialMsg>>>,
-    tasks: Vec<JoinHandle<()>>,
+    senders: Vec<UdpMulti>,
 }
 
 impl Index<usize> for UdpTasks {
-    type Output = mpsc::Sender<ChanMsg<SerialMsg>>;
+    type Output = UdpMulti;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.senders[index]
@@ -138,14 +150,10 @@ impl Index<usize> for UdpTasks {
 impl UdpTasks {
     pub fn new(namespaces: usize, chan_size: usize) -> Self {
         let mut senders = Vec::with_capacity(namespaces);
-        let mut tasks = Vec::new();
         for i in 0..namespaces {
-            let (udp_tx, udp_rx) = mpsc::channel(chan_size);
-            // create bg task for each sender
-            tasks.push(UdpTask::make(i, udp_rx));
-            senders.push(udp_tx);
+            senders.push(UdpMulti::new(i, chan_size));
         }
-        Self { senders, tasks }
+        Self { senders }
     }
     pub fn len(&self) -> usize {
         self.senders.len()
@@ -159,9 +167,6 @@ impl UdpTasks {
 impl Drop for UdpTasks {
     fn drop(&mut self) {
         trace!("udp_multi bg task drop called");
-        for handle in &self.tasks {
-            handle.abort();
-        }
     }
 }
 
@@ -191,7 +196,6 @@ mod tests {
         let listening_socket = UdpSocket::bind(test_address).await.unwrap();
 
         let tasks = UdpTasks::new(1, 100);
-        let sender = tasks[0].clone();
 
         let mut to_send = Message::new();
         let query = Query::query(test_name.clone(), RecordType::A);
@@ -200,7 +204,7 @@ mod tests {
         // create a channel to send and receive the response
         let (tx, rx) = oneshot::channel();
         // send to udp multi task
-        if let Err(e) = sender
+        if let Err(e) = tasks[0]
             .send(ChanMsg::new(
                 SerialMsg::new(to_send.to_bytes().unwrap(), test_address),
                 tx,
@@ -260,7 +264,6 @@ mod tests {
         let listening_socket = UdpSocket::bind(test_address).await.unwrap();
 
         let tasks = UdpTasks::new(1, 100);
-        let sender = tasks[0].clone();
 
         let mut to_send = Message::new();
         let query = Query::query(test_name.clone(), RecordType::A);
@@ -269,7 +272,7 @@ mod tests {
         // create a channel to send and receive the response
         let (tx, rx) = oneshot::channel();
         // send to udp multi task
-        if let Err(e) = sender
+        if let Err(e) = tasks[0]
             .send(ChanMsg::new(
                 SerialMsg::new(to_send.to_bytes().unwrap(), test_address),
                 tx,
