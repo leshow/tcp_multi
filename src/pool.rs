@@ -216,122 +216,67 @@ impl ConnectionPool {
         self._get_connection(permit).await
     }
 
+    pub async fn len(&self) -> usize {
+        self.0.connections.read().await.len()
+    }
+    pub async fn is_empty(&self) -> bool {
+        self.0.connections.read().await.is_empty()
+    }
+
     async fn _get_connection(
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<ConnectionHandle, PoolError> {
-        // Check if we should grow the pool first (read lock to check size)
-        let should_grow = {
+        // Take read lock once to check length and potentially search
+        let (create_conn, permit, needs_cleanup) = {
             let conns = self.0.connections.read().await;
-            conns.len() < self.0.config.max_connections
+            let len = conns.len();
+
+            // If under max_connections, prefer creating new connection (eager growth)
+            if len < self.0.config.max_connections {
+                drop(conns);
+                (true, permit, false)
+            } else {
+                // At capacity - search for usable connection
+                let (permit, needs_cleanup) = match self._round_robin(&conns, permit).await {
+                    Ok(h) => return Ok(h),
+                    Err((permit, needs_cleanup)) => (permit, needs_cleanup),
+                };
+                drop(conns);
+                // No usable connections found at capacity
+                (false, permit, needs_cleanup)
+            }
+        }; // Read lock dropped here
+
+        // Try to create new connection if under limit OR if cleanup is needed
+        let permit = if create_conn || needs_cleanup {
+            match self._create_connection(needs_cleanup, permit).await {
+                Ok(h) => return Ok(h),
+                Err(permit) => permit,
+            }
+        } else {
+            permit
         };
 
-        // If under max_connections, try to create a new connection immediately
-        if should_grow {
-            let mut conns = self.0.connections.write().await;
-
-            // Double-check after acquiring write lock
-            if conns.len() < self.0.config.max_connections {
-                match self.create_connection().await {
-                    Ok(new_conn) => {
-                        let handle = ConnectionHandle {
-                            _permit: permit,
-                            conn: new_conn.inner.conn.clone(),
-                            pool: Arc::downgrade(&self.0),
-                        };
-                        conns.push_front(new_conn);
-                        return Ok(handle);
-                    }
-                    Err(err) => {
-                        warn!(%err, "failed to create connection, falling back to existing");
-                        // Fall through to try existing connections
-                    }
-                }
-            }
-            // If creation failed or someone else created one, fall through to round-robin
+        // Fallback: (connection creation failed or we're at capacity)
+        let conns = self.0.connections.read().await;
+        if conns.is_empty() {
+            debug!("no connections available");
+            return Err(PoolError::AllConnectionsBusy);
         }
 
-        // Get connection using round-robin (read lock only)
-        let (len, cleanup) = {
-            let conns = self.0.connections.read().await;
-            let now = Instant::now();
-            let mut needs_cleanup = false;
+        match self._round_robin(&conns, permit).await {
+            Ok(h) => Ok(h),
+            Err(_) => {
+                debug!(
+                    len = conns.len(),
+                    max = self.0.config.max_connections,
+                    "_get_connection failed: no usable connections",
+                );
 
-            // Round-robin selection among usable connections
-            let start = self.0.round_robin.fetch_add(1, Ordering::Relaxed) % conns.len();
-
-            // Try from start to end
-            for i in start..conns.len() {
-                if conns[i].inner.conn.is_usable(now) {
-                    return Ok(ConnectionHandle {
-                        _permit: permit,
-                        conn: conns[i].inner.conn.clone(),
-                        pool: Arc::downgrade(&self.0),
-                    });
-                } else {
-                    needs_cleanup = true;
-                    conns[i].inner.conn.set_closing();
-                }
-            }
-
-            // Try from beginning to start
-            for i in 0..start {
-                if conns[i].inner.conn.is_usable(now) {
-                    return Ok(ConnectionHandle {
-                        _permit: permit,
-                        conn: conns[i].inner.conn.clone(),
-                        pool: Arc::downgrade(&self.0),
-                    });
-                } else {
-                    needs_cleanup = true;
-                    conns[i].inner.conn.set_closing();
-                }
-            }
-
-            // No usable connections found
-            (conns.len(), needs_cleanup)
-        };
-
-        // Try to create new connection if under limit OR if all existing connections are unusable
-        if len < self.0.config.max_connections || cleanup {
-            let mut conns = self.0.connections.write().await;
-
-            if cleanup {
-                info!("running cleanup");
-                // Clean up any closing connections first
-                conns.retain(|conn| !conn.inner.conn.is_closing());
-            }
-
-            // Re-check after acquiring write lock and cleanup to prevent race condition
-            if conns.len() >= self.0.config.max_connections {
-                debug!("already at max connections after acquiring write lock");
-                return Err(PoolError::AllConnectionsBusy);
-            }
-
-            match self.create_connection().await {
-                Ok(new_conn) => {
-                    let handle = ConnectionHandle {
-                        _permit: permit,
-                        conn: new_conn.inner.conn.clone(),
-                        // pool weak ref
-                        pool: Arc::downgrade(&self.0),
-                    };
-                    conns.push_front(new_conn);
-                    return Ok(handle);
-                }
-                Err(err) => {
-                    warn!(%err, "failed to create connection");
-                    return Err(err);
-                }
+                Err(PoolError::AllConnectionsBusy)
             }
         }
-        debug!(
-            len,
-            max = self.0.config.max_connections,
-            "_get_connection failed",
-        );
-
-        Err(PoolError::AllConnectionsBusy)
     }
 
     async fn create_connection(&self) -> Result<PoolConnection, PoolError> {
@@ -354,6 +299,89 @@ impl ConnectionPool {
 
     pub async fn cleanup(&self) {
         self.0.cleanup().await;
+    }
+
+    #[inline]
+    async fn _create_connection(
+        &self,
+        needs_cleanup: bool,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ConnectionHandle, OwnedSemaphorePermit> {
+        let mut conns = self.0.connections.write().await;
+
+        if needs_cleanup {
+            info!("running cleanup");
+            // Clean up any closing connections first
+            conns.retain(|conn| !conn.inner.conn.is_closing());
+        }
+
+        // Re-check after acquiring write lock and cleanup to prevent race condition
+        if conns.len() >= self.0.config.max_connections {
+            debug!("already at max connections after acquiring write lock");
+            // TODO should try to get another permit
+            return Err(permit);
+        }
+
+        match self.create_connection().await {
+            Ok(new_conn) => {
+                let handle = ConnectionHandle {
+                    _permit: permit,
+                    conn: new_conn.inner.conn.clone(),
+                    // pool weak ref
+                    pool: Arc::downgrade(&self.0),
+                };
+                conns.push_front(new_conn);
+                Ok(handle)
+            }
+            Err(err) => {
+                warn!(%err, "failed to create connection, falling back to existing");
+                // Fall through to try existing connections rather than failing immediately
+                Err(permit)
+            }
+        }
+    }
+
+    #[inline]
+    async fn _round_robin(
+        &self,
+        conns: &VecDeque<PoolConnection>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ConnectionHandle, (OwnedSemaphorePermit, bool)> {
+        let len = conns.len();
+        let mut needs_cleanup = false;
+        let now = Instant::now();
+
+        // Round-robin selection among usable connections
+        let start = self.0.round_robin.fetch_add(1, Ordering::Relaxed) % len;
+
+        // Try from start to end
+        for conn in conns.iter().skip(start) {
+            if conn.inner.conn.is_usable(now) {
+                return Ok(ConnectionHandle {
+                    _permit: permit,
+                    conn: conn.inner.conn.clone(),
+                    pool: Arc::downgrade(&self.0),
+                });
+            } else {
+                needs_cleanup = true;
+                conn.inner.conn.set_closing();
+            }
+        }
+
+        // Try from beginning to start
+        for conn in conns.iter().take(start) {
+            if conn.inner.conn.is_usable(now) {
+                return Ok(ConnectionHandle {
+                    _permit: permit,
+                    conn: conn.inner.conn.clone(),
+                    pool: Arc::downgrade(&self.0),
+                });
+            } else {
+                needs_cleanup = true;
+                conn.inner.conn.set_closing();
+            }
+        }
+        Err((permit, needs_cleanup))
     }
 }
 
@@ -410,5 +438,89 @@ impl PoolInner {
             self.config.max_connections,
             self.config.max_concurrent
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{net::TcpListener, sync::Notify};
+
+    async fn tcp_echo() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let started = Arc::new(Notify::new());
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn({
+            let started = started.clone();
+            async move {
+                loop {
+                    // we're started, tests can begin
+                    started.notify_one();
+                    if let Ok((socket, _)) = listener.accept().await {
+                        tokio::spawn(async move {
+                            // Keep the connection alive and echo data
+                            let mut buf = vec![0u8; 1024];
+                            while let Ok(n) = socket.try_read(&mut buf) {
+                                if n == 0 {
+                                    break;
+                                }
+                                let _ = socket.try_write(&buf[..n]);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        started.notified().await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_eager_connection_creation() {
+        let addr = tcp_echo().await;
+        let config = PoolConfig {
+            max_connections: 5,
+            ..Default::default()
+        };
+
+        let pool = ConnectionPool::new(addr, config);
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let handle = pool.get_connection().await.unwrap();
+            handles.push(handle);
+        }
+
+        let len = pool.len().await;
+        assert_eq!(len, 5, "Pool should have grown to max_connections");
+
+        let handle6 = pool.get_connection().await.unwrap();
+        let len = pool.len().await;
+        assert_eq!(len, 5, "Pool should not create more than max_connections");
+        drop(handle6);
+        drop(handles);
+    }
+
+    #[tokio::test]
+    async fn test_reuse_at_capacity() {
+        let addr = tcp_echo().await;
+        let config = PoolConfig {
+            max_connections: 2,
+            ..Default::default()
+        };
+
+        let pool = ConnectionPool::new(addr, config);
+
+        let _handle1 = pool.get_connection().await.unwrap();
+        let _handle2 = pool.get_connection().await.unwrap();
+
+        let len = pool.len().await;
+        assert_eq!(len, 2, "Should have 2 connections after 2 requests");
+
+        let _handle3 = pool.get_connection().await.unwrap();
+        let conns = pool.0.connections.read().await;
+        assert_eq!(conns.len(), 2, "should reuse existing connection");
     }
 }
