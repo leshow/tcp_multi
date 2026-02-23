@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use tcp_multi::pool::{ConnectionPool, PoolConfig};
+use tcp_multi::transport::udp_multi::{self, UdpMulti};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::{net::TcpStream, sync::Semaphore, time::interval};
 use tracing::{debug, info, level_filters::LevelFilter, trace, warn};
@@ -22,6 +23,7 @@ const DEFAULT_LOG_FORMAT: &str = "pretty";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportMode {
+    Udp,
     Pool,
     TcpConnection,
     TcpStreamPerMessage,
@@ -61,6 +63,7 @@ fn parse_args() -> Result<CliArgs> {
         [addr, max] | [addr, max, "--multi"] => (addr, max, TransportMode::TcpConnection),
         [addr, max, "--stream"] => (addr, max, TransportMode::TcpStreamPerMessage),
         [addr, max, "--pool"] => (addr, max, TransportMode::Pool),
+        [addr, max, "--udp"] => (addr, max, TransportMode::Udp),
         _ => bail!(usage()),
     };
 
@@ -138,12 +141,13 @@ async fn main() -> Result<()> {
         },
     );
     let config = TcpConnectionConfig::default();
+    let udp_send = UdpMulti::new(0, 1_000);
 
     loop {
-        let msg = match SerialMsg::recv(&udp).await {
+        let mut msg = match SerialMsg::recv(&udp).await {
             Ok(msg) => msg,
             Err(err) => {
-                debug!(%err, "udp recv failed");
+                warn!(%err, "udp recv failed");
                 continue;
             }
         };
@@ -159,6 +163,15 @@ async fn main() -> Result<()> {
         };
 
         match mode {
+            TransportMode::Udp => {
+                tokio::spawn({
+                    let udp = udp.clone();
+                    let udp_send = udp_send.clone();
+                    // set to downstream addr
+                    msg.set_addr(addr);
+                    async move { send_query_udp(&udp_send, udp, msg, reply_addr, permit).await }
+                });
+            }
             TransportMode::Pool => {
                 tokio::spawn({
                     let udp = udp.clone();
@@ -261,6 +274,40 @@ pub fn init_tracing(vars: Option<EnvVars>) -> Result<()> {
     }
     info!(log_filter, log_fmt, "initialized tracing");
     Ok(())
+}
+
+async fn send_query_udp(
+    conn: &UdpMulti,
+    udp: Arc<tokio::net::UdpSocket>,
+    msg: SerialMsg,
+    reply_addr: SocketAddr,
+    permit: OwnedSemaphorePermit,
+) -> Result<()> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+
+    let query = msg.query()?;
+    conn.send(udp_multi::ChanMsg {
+        to_send: msg,
+        reply,
+        query,
+    })
+    .await?;
+
+    match rx.await {
+        Ok(mut reply) => {
+            // restore reply addr
+            reply.set_addr(reply_addr);
+            trace!(?reply, "udp reply to client");
+            if let Err(err) = udp.send_to(reply.bytes(), reply.addr()).await {
+                warn!(%err, "udp reply failed");
+            }
+        }
+        Err(err) => {
+            warn!(%err, "oneshot tcp send failed");
+        }
+    };
+    drop(permit);
+    Ok::<_, anyhow::Error>(())
 }
 
 async fn send_query(

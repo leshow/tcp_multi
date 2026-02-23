@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     ops::Index,
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -10,7 +11,7 @@ use tokio::{
     self,
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
 };
 use tracing::*;
 
@@ -35,37 +36,47 @@ impl<T> ChanMsg<T> {
 
 pub type ChanMap<T> = HashMap<u16, T>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UdpMulti {
-    num: usize,
-    tx: mpsc::Sender<ChanMsg<SerialMsg>>,
-    tasks: JoinSet<anyhow::Result<()>>,
+    inner: Arc<UdpInner>,
 }
 
-impl Drop for UdpMulti {
+#[derive(Debug)]
+struct UdpInner {
+    num: usize,
+    tx: mpsc::Sender<ChanMsg<SerialMsg>>,
+    tasks: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl Drop for UdpInner {
     fn drop(&mut self) {
         trace!(num = self.num, "UdpMulti drop called");
-        self.tasks.abort_all();
+        if let Some(h) = &self.tasks {
+            h.abort();
+        }
     }
 }
 
 impl UdpMulti {
     pub fn new(num: usize, chan_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(chan_size);
-        let mut this = Self {
+        let mut inner = UdpInner {
             num,
             tx,
-            tasks: JoinSet::new(),
+            tasks: None,
         };
-        this.tasks.spawn(udp_multi(num, rx));
-        this
+        inner.tasks = Some(tokio::spawn(udp_multi(num, rx)));
+
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     pub async fn send(
         &self,
         msg: ChanMsg<SerialMsg>,
     ) -> Result<(), mpsc::error::SendError<ChanMsg<SerialMsg>>> {
-        self.tx.send(msg).await
+        self.inner.tx.send(msg).await
     }
 }
 
@@ -84,6 +95,7 @@ pub async fn udp_multi(
         tokio::select! {
             msg = SerialMsg::recv(&ns) => {
                 if let Ok(mut msg) = msg {
+                    debug!(addr = ?msg.addr(), bytes = msg.bytes().len(), id = ?global_id, ?num, "received from");
                     let id = msg.msg_id();
                     if let Some((send, query, orig_id)) = map.remove(&id) {
                         let Ok(response_query) = msg.query() else {

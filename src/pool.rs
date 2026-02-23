@@ -245,7 +245,7 @@ impl ConnectionPool {
         };
         // Try to create new connection if under limit OR if all existing connections are unusable
         if grow || cleanup {
-            debug!(?grow, ?cleanup, "creating new connection");
+            debug!(%grow, %cleanup, "creating new connection");
             return self._create_connection(cleanup).await;
         }
         Err(PoolError::AllConnectionsBusy)
@@ -400,8 +400,6 @@ impl PoolInner {
     }
     async fn stats(&self) {
         let conns = self.connections.read().await;
-        let original_count = conns.len();
-
         let now = Instant::now();
 
         // Collect stats before cleanup
