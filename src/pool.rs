@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    fmt::Debug,
     net::SocketAddr,
     ops::Deref,
     sync::{
@@ -46,6 +47,18 @@ pub struct PoolInner {
 #[derive(Clone)]
 pub struct PoolConnection {
     inner: ConnectionInner,
+}
+
+impl Debug for PoolConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolConnection")
+            .field(
+                "available_permits",
+                &self.inner.max_handles.available_permits(),
+            )
+            .field("connection", &self.inner.conn)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -242,31 +255,17 @@ impl ConnectionPool {
         let mut count = 0;
 
         loop {
+            let notified = self.0.permit_available.notified();
             match self.try_get_connection().await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
                     count += 1;
                     warn!(count, ?err, "waiting for wakeup");
-                    self.0.permit_available.notified().await;
-                    trace!("got wakeup, trying again");
-                    // match err {
-                    //     PoolError::AllConnectionsBusy => {
-                    //         // Connections exist but are busy - wait for notification
-                    //         trace!(?count, "connections busy, waiting for available permit");
-                    //         count += 1;
-                    //         self.0.permit_available.notified().await;
-                    //     }
-                    //     PoolError::ConnectionCreation(ref tcp_err) => {
-                    //         // Connection creation failed - retry with backoff
-                    //         if count == 0 {
-                    //             warn!(%tcp_err, "failed to create connection, retrying");
-                    //         } else if count % 10 == 0 {
-                    //             warn!(%tcp_err, ?count, "connection creation still failing");
-                    //         }
-                    //         count += 1;
-                    //         tokio::time::sleep(Duration::from_millis(100)).await;
-                    //     }
-                    // }
+                    notified.await;
+                    // TODO: should this function ever error or loop indefinitely?
+                    if count >= 3 {
+                        return Err(PoolError::AllConnectionsBusy);
+                    }
                 }
             }
         }
@@ -421,8 +420,8 @@ impl PoolInner {
         }
         // Log pool stats
         info!(
-            "Pool stats: connections={}, handles_in_use={}, available={}, max_connections={}, max_concurrent_per_conn={}",
-            original_count,
+            "Pool stats: connections={:?}, handles_in_use={}, available={}, max_connections={}, max_concurrent_per_conn={}",
+            conns,
             handles_in_use,
             handles_available,
             self.config.max_connections,

@@ -48,7 +48,7 @@ pub struct ConnectionStats {
     pub pending_responses: usize,
     pub current_query_id: u16,
     pub age: Duration,
-    pub time_since_last_read: Duration,
+    pub last_read: Duration,
 }
 
 #[derive(Debug)]
@@ -137,8 +137,14 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stats = self.stats();
         f.debug_struct("TcpConnection")
-            .field("stats", &self.stats())
+            .field("addr", &stats.addr)
+            .field("queries_sent", &stats.addr)
+            .field("pending_responses", &stats.pending_responses)
+            .field("cur_query_id", &stats.current_query_id)
+            .field("age", &stats.age)
+            .field("last_read", &stats.last_read)
             .finish()
     }
 }
@@ -359,7 +365,7 @@ where
             pending_responses: self.state.pending_count.load(Ordering::Acquire),
             current_query_id: self.state.next_id.load(Ordering::Relaxed),
             age: now.duration_since(self.created_at),
-            time_since_last_read: now.duration_since(self.last_read()),
+            last_read: now.duration_since(self.last_read()),
         }
     }
     // copied from new for testing
