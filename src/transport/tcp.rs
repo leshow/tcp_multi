@@ -280,10 +280,10 @@ where
         let old = self.state.is_closing.swap(true, Ordering::AcqRel);
         debug!(old_closing = old, "set_closing called"); // Add this debug
     }
-    fn is_closing(&self) -> bool {
+    pub fn is_closing(&self) -> bool {
         self.state.is_closing.load(Ordering::Acquire)
     }
-    fn max_in_flight(&self) -> bool {
+    pub fn max_in_flight(&self) -> bool {
         if let Some(max) = self.max_in_flight {
             let pending = self.state.pending_count.load(Ordering::Acquire);
             if pending >= max {

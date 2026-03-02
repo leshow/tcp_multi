@@ -17,7 +17,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-use crate::{TcpConnection, TcpConnectionConfig, TcpConnectionError};
+use crate::transport::tcp::{TcpConnection, TcpConnectionConfig, TcpConnectionError};
 
 #[derive(Debug, Error)]
 pub enum PoolError {
