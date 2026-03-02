@@ -15,16 +15,19 @@ use std::{
 use atomic_time::AtomicInstant;
 use socket2::TcpKeepalive;
 use thiserror::Error;
-#[cfg(feature = "locking")]
-use tokio::io::{AsyncReadExt, AsyncWrite};
 #[cfg(not(feature = "locking"))]
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "locking")]
+use tokio::{
+    io::{AsyncReadExt, AsyncWrite},
+    sync::Mutex as AsyncMutex,
+};
 use tokio::{
     net::{
         TcpSocket, TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex as AsyncMutex, oneshot},
+    sync::oneshot,
     task::JoinSet,
 };
 use tracing::{debug, trace, warn};
@@ -108,7 +111,6 @@ impl<T> PendingSend<T> {
 
 pub struct TcpConnection<R = OwnedReadHalf, W = OwnedWriteHalf> {
     addr: SocketAddr,
-    pending: ResponseMap<PendingResponse<SerialMsg>>,
     #[cfg(feature = "locking")]
     writer: AsyncMutex<W>,
     state: Arc<State>,
@@ -153,6 +155,7 @@ struct State {
     next_id: AtomicU16,
     is_closing: AtomicBool,
     last_read: AtomicInstant,
+    pending: ResponseMap<PendingResponse<SerialMsg>>,
     pending_count: AtomicUsize,
 }
 
@@ -211,7 +214,7 @@ where
 
             // insert entry
             {
-                let mut lock = self.pending.lock().unwrap();
+                let mut lock = self.state.pending.lock().unwrap();
                 lock.insert(
                     next_id,
                     PendingResponse {
@@ -248,7 +251,7 @@ where
             //     return Err(SendError::Closed { query });
             // }
 
-            let DnsQuery { mut to_send, reply } = query;
+            let DnsQuery { to_send, reply } = query;
             if let Err(err) = self
                 .queued_tx
                 .send(PendingSend {
@@ -260,6 +263,7 @@ where
             {
                 warn!(%err, "TCP pending queue dropped, setting connection to closing");
                 self.set_closing();
+                self.remove_pending(next_id);
                 return Err(SendError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "connection closed",
@@ -270,7 +274,7 @@ where
     }
 
     fn remove_pending(&self, id: u16) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.state.pending.lock().unwrap();
         if let Some(resp) = pending.remove(&id) {
             self.state.pending_count.fetch_sub(1, Ordering::Release);
             drop(resp.reply);
@@ -377,36 +381,23 @@ where
         config: TcpConnectionConfig,
         read_fd: Option<RawFd>,
     ) -> Result<Self, TcpConnectionError> {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-
         let mut conn = {
             #[cfg(feature = "locking")]
             {
                 let send = AsyncMutex::new(send);
-                new_conn(read_fd, addr, config.max_in_flight, pending.clone(), send)
+                new_conn(read_fd, addr, config.max_in_flight, send)
             }
             #[cfg(not(feature = "locking"))]
             {
                 let (queued_tx, queued_rx) = tokio::sync::mpsc::channel(10_0000);
-                let mut conn = new_conn(
-                    read_fd,
-                    addr,
-                    config.max_in_flight,
-                    pending.clone(),
-                    queued_tx,
-                );
+                let mut conn = new_conn(read_fd, addr, config.max_in_flight, queued_tx);
 
-                conn.tasks.spawn(send_half(
-                    send,
-                    queued_rx,
-                    conn.state.clone(),
-                    pending.clone(),
-                ));
+                conn.tasks
+                    .spawn(send_half(send, queued_rx, conn.state.clone()));
                 conn
             }
         };
-        conn.tasks
-            .spawn(read_half(read, addr, conn.state.clone(), pending));
+        conn.tasks.spawn(read_half(read, addr, conn.state.clone()));
 
         Ok(conn)
     }
@@ -417,14 +408,12 @@ fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
-    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
     writer: AsyncMutex<W>,
 ) -> TcpConnection<R, W> {
     let now = Instant::now();
     TcpConnection {
         read_fd,
         addr,
-        pending,
         tasks: JoinSet::new(),
         writer,
         max_in_flight,
@@ -434,6 +423,7 @@ fn new_conn<R, W>(
             next_id: AtomicU16::new(0),
             is_closing: AtomicBool::new(false),
             last_read: AtomicInstant::new(now),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             pending_count: AtomicUsize::new(0),
         }),
     }
@@ -444,14 +434,12 @@ fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
-    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
     queued_tx: tokio::sync::mpsc::Sender<PendingSend<SerialMsg>>,
 ) -> TcpConnection<R, W> {
     let now = Instant::now();
     TcpConnection {
         read_fd,
         addr,
-        pending,
         tasks: JoinSet::new(),
         max_in_flight,
         created_at: now,
@@ -463,6 +451,7 @@ fn new_conn<R, W>(
             is_closing: AtomicBool::new(false),
             last_read: AtomicInstant::new(now),
             pending_count: AtomicUsize::new(0),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }),
     }
 }
@@ -472,7 +461,6 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
     mut conn: W,
     mut queued_msgs: tokio::sync::mpsc::Receiver<PendingSend<SerialMsg>>,
     state: Arc<State>,
-    pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> std::io::Result<()> {
     while let Some(PendingSend {
         mut to_send,
@@ -488,7 +476,7 @@ async fn send_half<W: AsyncWriteExt + Unpin>(
         match to_send.writev(&mut conn).await {
             Ok(_) => {
                 {
-                    let mut lock = pending.lock().unwrap();
+                    let mut lock = state.pending.lock().unwrap();
                     // insert next_id and for recv
                     lock.insert(
                         next_id,
@@ -522,7 +510,6 @@ async fn read_half<R: AsyncReadExt + Unpin>(
     mut recv: R,
     addr: SocketAddr,
     state: Arc<State>,
-    pending: ResponseMap<PendingResponse<SerialMsg>>,
 ) -> std::io::Result<()> {
     loop {
         match SerialMsg::read(&mut recv, addr).await {
@@ -536,7 +523,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
                 state.last_read.store(Instant::now(), Ordering::Release);
                 let resp_id = msg.msg_id();
                 let (r, is_empty) = {
-                    let mut lock = pending.lock().unwrap();
+                    let mut lock = state.pending.lock().unwrap();
                     let entry = lock.remove(&resp_id);
                     if entry.is_some() {
                         state.pending_count.fetch_sub(1, Ordering::Release);
@@ -576,7 +563,7 @@ async fn read_half<R: AsyncReadExt + Unpin>(
         };
     }
     // Notify all pending requests of the error
-    let mut pending = pending.lock().unwrap();
+    let mut pending = state.pending.lock().unwrap();
     for (_id, resp) in pending.drain() {
         // Just drop the sender, which will signal an error to the receiver
         drop(resp.reply);
