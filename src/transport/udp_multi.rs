@@ -11,7 +11,7 @@ use tokio::{
     self,
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
 use tracing::*;
 
