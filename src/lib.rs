@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     marker::PhantomData,
     mem,
@@ -13,6 +12,7 @@ use std::{
 };
 
 use atomic_time::AtomicInstant;
+use rustc_hash::FxHashMap;
 use socket2::TcpKeepalive;
 use thiserror::Error;
 use tokio::{
@@ -31,7 +31,6 @@ use crate::msg::SerialMsg;
 pub mod dpool;
 pub mod msg;
 pub mod pool;
-pub mod stream;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TcpConnectionConfig {
@@ -152,7 +151,7 @@ struct State {
     pending_count: AtomicUsize,
 }
 
-type ResponseMap<T> = Arc<Mutex<HashMap<u16, T>>>;
+type ResponseMap<T> = Arc<Mutex<FxHashMap<u16, T>>>;
 
 impl TcpConnection<OwnedReadHalf, OwnedWriteHalf> {
     pub async fn new(
@@ -375,7 +374,7 @@ where
         config: TcpConnectionConfig,
         read_fd: Option<RawFd>,
     ) -> Result<Self, TcpConnectionError> {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(FxHashMap::default()));
 
         let mut conn = {
             #[cfg(feature = "locking")]
@@ -415,7 +414,7 @@ fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
-    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
+    pending: Arc<Mutex<FxHashMap<u16, PendingResponse<SerialMsg>>>>,
     writer: AsyncMutex<W>,
 ) -> TcpConnection<R, W> {
     let now = Instant::now();
@@ -442,7 +441,7 @@ fn new_conn<R, W>(
     read_fd: Option<RawFd>,
     addr: SocketAddr,
     max_in_flight: Option<usize>,
-    pending: Arc<Mutex<HashMap<u16, PendingResponse<SerialMsg>>>>,
+    pending: Arc<Mutex<FxHashMap<u16, PendingResponse<SerialMsg>>>>,
     queued_tx: tokio::sync::mpsc::Sender<PendingSend<SerialMsg>>,
 ) -> TcpConnection<R, W> {
     let now = Instant::now();
